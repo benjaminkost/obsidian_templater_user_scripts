@@ -1,27 +1,27 @@
 /**
  * Templater User Script: createAtomicNotes
  * 
- * Konvertiert aus Python (create_notes_from_big_note).
- * Teilt ein langes Dokument anhand seiner Überschriften (#, ##, ###, ...) in atomare Notizen auf.
- * Baut dabei automatisch die Eltern-Kind-Hierarchie (Breadcrumbs) in die 'mytags'-Metadaten ein.
+ * Converted from Python (create_notes_from_big_note).
+ * Splits a long document into atomic notes based on its headings (#, ##, ###, ...).
+ * Automatically writes the parent heading into the 'up' metadata property.
  * 
- * Verwendung:
- * 1) Interaktiv im Template:
+ * Usage:
+ * 1) Interactively in a template:
  *    <%* await tp.user.createAtomicNotes(tp) -%>
  * 
- * 2) Mit Optionen aufrufen:
+ * 2) Calling with options:
  *    <%* await tp.user.createAtomicNotes(tp, {
- *        sourceFile: "Pfad/zur/grossen_notiz.md",
- *        templateFile: "5 - Templates and Scripts/Template Notes/MeinTemplate.md",
- *        existingTags: ["202610091200 - Oberthema"],
- *        targetFolder: "" // Root des Vaults oder z.B. "1 - Rough Notes"
+ *        sourceFile: "Path/to/big_note.md",
+ *        templateFile: "5 - Templates and Scripts/Template Notes/MyTemplate.md",
+ *        existingTags: ["202610091200 - Parent Topic"],
+ *        targetFolder: "" // Vault root or e.g. "1 - Rough Notes"
  *    }) -%>
  */
 
 function deleteMetadataInString(fileStr) {
     if (!fileStr) return "";
     const normalized = fileStr.replace(/\r\n/g, "\n");
-    // Entfernt Frontmatter am Anfang der Notiz (--- ... ---)
+    // Removes the frontmatter at the beginning of the note (--- ... ---)
     return normalized.replace(/^---\n[\s\S]*?\n---\s*\n?/, "");
 }
 
@@ -56,19 +56,19 @@ function createUpperPartOfTemplate(genericTemplateStart, mytagsList, aliases = n
     let finalTemplate = genericTemplateStart || "";
     const timestamp = window.moment ? window.moment().format("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE");
 
-    // 1. Zeitstempel ("created date:", "created date": oder created date:)
+    // 1. Timestamp ("created date:", "created date": or created date:)
     const createdDateRegex = /\n["']?created date:?["']?:?\s*.*(\n|$)/i;
     if (createdDateRegex.test(finalTemplate)) {
         finalTemplate = finalTemplate.replace(createdDateRegex, `\n"created date": ${timestamp}$1`);
     }
 
-    // Templater-Platzhalter für Datum ersetzen, falls vorhanden
+    // Replace Templater date placeholders, if present
     finalTemplate = finalTemplate.replaceAll('<% tp.date.now("DD.MM.YYYY HH:mm") %>', timestamp);
     finalTemplate = finalTemplate.replaceAll("<% tp.date.now('DD.MM.YYYY HH:mm') %>", timestamp);
     finalTemplate = finalTemplate.replaceAll('<%tp.date.now("DD.MM.YYYY HH:mm")%>', timestamp);
     finalTemplate = finalTemplate.replaceAll("<%tp.date.now('DD.MM.YYYY HH:mm')%>", timestamp);
 
-    // 2. up-Sektion (statt mytags)
+    // 2. up section (instead of mytags)
     const strOfUp = (mytagsList || []).map(tag => `  - "[[${tag}]]"\n`).join("");
     if (strOfUp) {
         const regexForUpSection = /^up:[ \t]*(?:\n((?:[ \t]+-.*(?:\n|$))*))?/m;
@@ -86,14 +86,14 @@ function createUpperPartOfTemplate(genericTemplateStart, mytagsList, aliases = n
         }
     }
 
-    // 3. Aliases-Sektion
+    // 3. Aliases section
     if (aliases && aliases.length > 0) {
         const strOfAliases = aliases.map(alias => `  - ${alias}\n`).join("");
         const regexForAliasesSection = /(\naliases:\n)([\s\S]*?)(?=^[a-zA-Z0-9_-]+:|^---|\Z)/m;
 
         if (regexForAliasesSection.test(finalTemplate)) {
             finalTemplate = finalTemplate.replace(regexForAliasesSection, (match, p1, p2) => {
-                // Bereinige bestehende Zeilen von unaufgeloesten Templater-Tags wie <% tp.file.title.split... %>
+                // Clean existing lines of unresolved Templater tags such as <% tp.file.title.split... %>
                 const cleanedExisting = p2
                     .split("\n")
                     .filter(line => !line.includes("<%") && line.trim().length > 0)
@@ -113,33 +113,33 @@ function createUpperPartOfTemplate(genericTemplateStart, mytagsList, aliases = n
 
 function cleanTitle(title) {
     if (!title) return "";
-    // Entfernt fuehrende Nummerierungen wie "1. ", "1.1 ", "1.1.2 ", etc.
+    // Removes leading numbering such as "1. ", "1.1 ", "1.1.2 ", etc.
     const noStructureNumbers = title.replace(/^(\d+[\.\-_)]?)+\s*/, "").trim();
-    // Entfernt ungueltige Zeichen fuer Obsidian-Dateinamen: \ / : | # ^ [ ] * ? " < >
+    // Removes characters that are invalid in Obsidian file names: \ / : | # ^ [ ] * ? " < >
     const safeTitle = noStructureNumbers.replace(/[\\/:|#^\[\]*?"<>]/g, "").trim();
     return safeTitle;
 }
 
 /**
- * Fragt ab, unter welcher Ueberschrift des Templates der Text eingefuegt werden soll.
- * Der Text landet direkt unter der gewaehlten Ueberschrift, alles danach im Template
- * folgt unter dem Text. "Direkt nach den Metadaten" laesst das Template unveraendert geteilt.
+ * Asks under which heading of the template the text should be inserted.
+ * The text is placed directly under the chosen heading; everything after it in the template
+ * follows below the text. "Directly after the metadata" keeps the template split as is.
  *
- * Optionen:
- *   contentHeading     - Ueberschrift (Text ohne #) vorgeben, dann keine Abfrage
- *   askContentHeading  - false = nicht abfragen
+ * Options:
+ *   contentHeading     - preset the heading (text without #), no prompt then
+ *   askContentHeading  - false = do not prompt
  */
 async function chooseContentHeading(tp, options, templateStart, templateEnd) {
     if (options.askContentHeading === false && !options.contentHeading) {
         return { templateStart, templateEnd };
     }
 
-    // Ueberschriften im Rest des Templates suchen (Code-Bloecke ignorieren)
+    // Find headings in the rest of the template (ignore code blocks)
     const headings = [];
     let offset = 0;
     let inFence = false;
     for (const line of templateEnd.split("\n")) {
-        const lineEnd = offset + line.length + 1; // inkl. Zeilenumbruch
+        const lineEnd = offset + line.length + 1; // incl. line break
         if (/^\s*(```|~~~)/.test(line)) {
             inFence = !inFence;
         } else if (!inFence) {
@@ -148,8 +148,8 @@ async function chooseContentHeading(tp, options, templateStart, templateEnd) {
         }
         offset = lineEnd;
     }
-    // Reine Struktur-Ueberschriften sind kein Ziel fuer den Text -> nicht zur Auswahl anbieten.
-    // Bleibt keine uebrig, findet keine Abfrage statt.
+    // Pure structural headings are not a target for the text -> do not offer them for selection.
+    // If none remain, no prompt is shown.
     const ignoredHeadings = (options.ignoredHeadings || ["Quellen", "Source", "Übungsaufgaben", "Unterthemen"])
         .map(h => h.toLowerCase());
     const selectable = headings.filter(h => !ignoredHeadings.includes(h.title.toLowerCase()));
@@ -182,14 +182,14 @@ async function resolveTemplate(app, tp, options) {
     let templateStart = "";
     let templateEnd = "";
 
-    // A) Explizit als Strings uebergeben
+    // A) Passed explicitly as strings
     if (typeof options.templateStart === "string") {
         templateStart = options.templateStart;
         templateEnd = typeof options.templateEnd === "string" ? options.templateEnd : "";
         return { templateStart, templateEnd };
     }
 
-    // B) Explizite Dateipfade
+    // B) Explicit file paths
     if (options.templateStartFile) {
         const file = app.vault.getAbstractFileByPath(options.templateStartFile);
         if (file) templateStart = await app.vault.read(file);
@@ -202,13 +202,13 @@ async function resolveTemplate(app, tp, options) {
         return { templateStart, templateEnd };
     }
 
-    // C) Einzelne Template-Datei (TFile oder Pfad)
+    // C) Single template file (TFile or path)
     let templateFile = options.templateFile;
     if (typeof templateFile === "string") {
         templateFile = app.vault.getAbstractFileByPath(templateFile);
     }
 
-    // D) Interaktive Auswahl per Suggester, falls nicht angegeben
+    // D) Interactive selection via suggester if not specified
     if (!templateFile && tp && tp.system) {
         const templateFolder = "5 - Templates and Scripts/Template Notes";
         let templateFiles = app.vault.getMarkdownFiles()
@@ -229,16 +229,16 @@ async function resolveTemplate(app, tp, options) {
 
     if (templateFile) {
         const content = await app.vault.read(templateFile);
-        // Pruefen auf Cursor / Split-Marker
+        // Check for cursor / split marker
         const splitMarkerRegex = /<%[\s*_]*tp\.file\.cursor\([^)]*\)[\s*_]*%>|%%CONTENT%%|<!--\s*content\s*-->/i;
         const match = content.match(splitMarkerRegex);
         if (match) {
             templateStart = content.substring(0, match.index);
             templateEnd = content.substring(match.index + match[0].length);
         } else {
-            // Kein Marker: Template am Ende des Frontmatters teilen.
-            // -> Frontmatter = Start, Inhalt der Ueberschrift folgt direkt danach,
-            //    der Rest des Templates kommt unter den Inhalt.
+            // No marker: split the template at the end of the frontmatter.
+            // -> Frontmatter = start, the heading's content follows directly after it,
+            //    the rest of the template goes below the content.
             const normalized = content.replace(/\r\n/g, "\n");
             const fmMatch = normalized.match(/^---\n[\s\S]*?\n---[ \t]*(\n|$)/);
             if (fmMatch) {
@@ -249,7 +249,7 @@ async function resolveTemplate(app, tp, options) {
                 templateEnd = "";
             }
 
-            // Abfrage: Unter welcher Ueberschrift des Templates soll der Text eingefuegt werden?
+            // Prompt: under which heading of the template should the text be inserted?
             const split = await chooseContentHeading(tp, options, templateStart, templateEnd);
             templateStart = split.templateStart;
             templateEnd = split.templateEnd;
@@ -257,7 +257,7 @@ async function resolveTemplate(app, tp, options) {
         return { templateStart, templateEnd };
     }
 
-    // Fallback: Standard-Header
+    // Fallback: default header
     templateStart = `---\n"created date:": \naliases:\nmytags:\n---\n`;
     templateEnd = "";
     return { templateStart, templateEnd };
@@ -266,7 +266,7 @@ async function resolveTemplate(app, tp, options) {
 module.exports = async function (tp, options = {}) {
     const app = tp.app || window.app;
 
-    // 1. Quelldatei bestimmen
+    // 1. Determine the source file
     let sourceFile = null;
     if (options.sourceFile) {
         sourceFile = typeof options.sourceFile === "string"
@@ -289,10 +289,10 @@ module.exports = async function (tp, options = {}) {
         return;
     }
 
-    // 2. Templates (Start und End) laden
+    // 2. Load templates (start and end)
     const { templateStart, templateEnd } = await resolveTemplate(app, tp, options);
 
-    // 3. Oberthema / existingTags bestimmen
+    // 3. Determine parent topic / existingTags
     let existingTags = options.existingTags || [];
     if (typeof existingTags === "string") {
         existingTags = [existingTags];
@@ -309,10 +309,10 @@ module.exports = async function (tp, options = {}) {
         }
     }
 
-    // 4. Zielordner (Standard: Root des Vaults, wie im Python-Skript)
+    // 4. Target folder (default: vault root, as in the Python script)
     const targetFolder = (options.targetFolder !== undefined) ? options.targetFolder.replace(/\/+$/, "") : "";
 
-    // 5. Quelldatei auslesen und bereinigen
+    // 5. Read and clean the source file
     let fileStr = (await app.vault.read(sourceFile)).replace(/\r\n/g, "\n");
     fileStr = deleteMetadataInString(fileStr);
 
@@ -323,7 +323,7 @@ module.exports = async function (tp, options = {}) {
         return;
     }
 
-    // 6. Zeilen durchlaufen und Hierarchie aufbauen
+    // 6. Iterate over lines and build the hierarchy
     const lines = fileStr.split("\n");
     const regexForHeadlineTitle = /^(#+)\s+(.*)/;
     const currentPath = {};
@@ -339,7 +339,7 @@ module.exports = async function (tp, options = {}) {
             const title = match[2].trim();
             const currentLevel = hashes.length;
 
-            // Abbruchbedingung bei "Referenz" (analog zu exit() im Python-Code) bzw. options.stopHeadings
+            // Stop condition at "Referenz" (like exit() in the Python code) or options.stopHeadings
             if ((options.stopHeadings || ["Referenz"]).includes(title)) {
                 break;
             }
@@ -361,28 +361,28 @@ module.exports = async function (tp, options = {}) {
             currentPath[currentLevel] = currentFileName;
             console.log(currentPath);
 
-            // Alle Ebenen unterhalb der aktuellen Ebene entfernen
+            // Remove all levels below the current level
             for (const k of Object.keys(currentPath)) {
                 if (Number(k) > currentLevel) {
                     delete currentPath[k];
                 }
             }
 
-            // Eltern-Titel ermitteln (alle Ebenen < currentLevel)
+            // Determine parent titles (all levels < currentLevel)
             const parentTitles = Object.keys(currentPath)
                 .map(Number)
                 .filter(k => k < currentLevel)
                 .sort((a, b) => a - b)
                 .map(k => currentPath[k]);
 
-            // Nur die direkt uebergeordnete Ueberschrift kommt in "up".
-            // Hat die Ueberschrift keinen Elternteil, wird (falls gewaehlt) das Oberthema verwendet.
+            // Only the direct parent heading goes into "up".
+            // If the heading has no parent, the parent topic (if chosen) is used.
             const directParent = parentTitles.length > 0 ? [parentTitles[parentTitles.length - 1]] : (existingTags || []);
             const upList = addAliasToListOfMytags(directParent);
 
             let noteStartText = createUpperPartOfTemplate(templateStart, upList, [safeTitle]);
 
-            // Templater-Titel ersetzen (sowohl vollstaendiger Name als auch bereinigter Alias)
+            // Replace Templater title (both full name and cleaned alias)
             noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, safeTitle);
             noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\s*%>/gi, currentFileName);
 
@@ -406,7 +406,7 @@ module.exports = async function (tp, options = {}) {
         return;
     }
 
-    // 7. Notizen im Vault erstellen
+    // 7. Create notes in the vault
     let createdCount = 0;
     for (const note of notes) {
         const body = note.bodyLines.join("\n").trim();

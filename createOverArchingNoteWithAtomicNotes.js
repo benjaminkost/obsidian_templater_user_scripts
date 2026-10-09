@@ -1,19 +1,19 @@
 /**
  * Templater User Script: createOverArchingNoteWithAtomicNotes
  *
- * Ablauf wie createAtomicNotes.js (Aufteilen der geöffneten Notiz anhand ihrer Überschriften
- * in atomare Notizen), mit Unterschieden:
- *  - Die geöffnete Notiz ist die übergeordnete Notiz: Atomare Notizen ohne eigenen
- *    Elternteil (oberste Überschriftsebene) bekommen sie als "up".
- *  - Der für die Notizen genutzte Text wird danach aus der geöffneten Datei gelöscht
- *    (von der ersten Überschrift bis vor "Übungsaufgaben"/"Quellen"/...). An dieser Stelle
- *    steht anschließend der Abschnitt "# Unterthemen" mit einer Dataview-Abfrage.
- *    Mit deleteSourceText: false bleibt der Text erhalten und der Abschnitt wird nur ergänzt.
+ * Works like createAtomicNotes.js (splits the open note into atomic notes based on its headings),
+ * with these differences:
+ *  - The open note is the overarching note: atomic notes without a parent of their own
+ *    (top heading level) get it as "up".
+ *  - The text used for the notes is then deleted from the open file
+ *    (from the first heading up to "Übungsaufgaben"/"Quellen"/...). In its place,
+ *    the section "# Unterthemen" with a Dataview query is inserted.
+ *    With deleteSourceText: false the text is kept and the section is only added.
  *
- * Verwendung:
+ * Usage:
  *   <%* await tp.user.createOverArchingNoteWithAtomicNotes(tp) -%>
  *
- * Optionen (werden an createAtomicNotes weitergereicht):
+ * Options (passed on to createAtomicNotes):
  *   templateFile, targetFolder, sourceFile, deleteSourceText, ...
  */
 
@@ -38,7 +38,7 @@ module.exports = async function (tp, options = {}) {
         return;
     }
 
-    // Geöffnete Datei = übergeordnete Notiz
+    // Open file = overarching note
     let openFile = null;
     if (options.sourceFile) {
         openFile = typeof options.sourceFile === "string"
@@ -52,8 +52,8 @@ module.exports = async function (tp, options = {}) {
         return;
     }
 
-    // Atomare Notizen erstellen; die geöffnete Notiz wird als "up" der obersten Ebene gesetzt.
-    // "Übungsaufgaben", "Quellen" und "Unterthemen" sind keine Themen und werden nicht aufgeteilt.
+    // Create atomic notes; the open note is set as "up" of the top level.
+    // "Übungsaufgaben", "Quellen" and "Unterthemen" are not topics and are not split.
     const stopHeadings = options.stopHeadings || ["Übungsaufgaben", "Quellen", "Referenz", "Unterthemen"];
     const result = await tp.user.createAtomicNotes(tp, {
         ...options,
@@ -63,7 +63,7 @@ module.exports = async function (tp, options = {}) {
         skipPrompt: true
     });
 
-    // createAtomicNotes gibt bei Abbruch (z.B. keine Überschriften) undefined zurück
+    // createAtomicNotes returns undefined on abort (e.g. no headings)
     if (result === undefined) return;
 
     const content = (await app.vault.read(openFile)).replace(/\r\n/g, "\n");
@@ -73,8 +73,8 @@ module.exports = async function (tp, options = {}) {
 
     let newContent;
     if (deleteSourceText) {
-        // Verwendeten Text entfernen: von der ersten Überschrift bis zur ersten Stopp-Überschrift
-        // (bzw. bis zum Dateiende). Text vor der ersten Überschrift und die Metadaten bleiben erhalten.
+        // Remove the used text: from the first heading to the first stop heading
+        // (or to the end of the file). Text before the first heading and the metadata are kept.
         const fm = content.match(/^---\n[\s\S]*?\n---[ \t]*(\n|$)/);
         const bodyStart = fm ? fm[0].length : 0;
         const body = content.slice(bodyStart);
@@ -102,7 +102,7 @@ module.exports = async function (tp, options = {}) {
         new Notice("ℹ️ Abschnitt '# Unterthemen' ist bereits vorhanden.");
         return "";
     } else {
-        // Einfügen vor "# Übungsaufgaben", sonst vor "# Quellen", sonst am Ende
+        // Insert before "# Übungsaufgaben", otherwise before "# Quellen", otherwise at the end
         const anchor = content.match(/^#\s+Übungsaufgaben\s*$/m) || content.match(/^#\s+Quellen\s*$/m);
         if (anchor) {
             newContent = content.slice(0, anchor.index) + block + "\n" + content.slice(anchor.index);
