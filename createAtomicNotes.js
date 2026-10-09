@@ -56,10 +56,10 @@ function createUpperPartOfTemplate(genericTemplateStart, mytagsList, aliases = n
     let finalTemplate = genericTemplateStart || "";
     const timestamp = window.moment ? window.moment().format("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE");
 
-    // 1. Zeitstempel ("created date:" bzw. "created date:": ...)
-    const createdDateRegex = /(\n["']?created date["']?:\s*).*(\n)/i;
+    // 1. Zeitstempel ("created date:", "created date": oder created date:)
+    const createdDateRegex = /\n["']?created date:?["']?:?\s*.*(\n|$)/i;
     if (createdDateRegex.test(finalTemplate)) {
-        finalTemplate = finalTemplate.replace(createdDateRegex, `$1${timestamp}$2`);
+        finalTemplate = finalTemplate.replace(createdDateRegex, `\n"created date": ${timestamp}$1`);
     }
 
     // Templater-Platzhalter für Datum ersetzen, falls vorhanden
@@ -68,21 +68,22 @@ function createUpperPartOfTemplate(genericTemplateStart, mytagsList, aliases = n
     finalTemplate = finalTemplate.replaceAll('<%tp.date.now("DD.MM.YYYY HH:mm")%>', timestamp);
     finalTemplate = finalTemplate.replaceAll("<%tp.date.now('DD.MM.YYYY HH:mm')%>", timestamp);
 
-    // 2. Mytags-Sektion
-    const strOfMytags = (mytagsList || []).map(tag => `  - "[[${tag}]]"\n`).join("");
-    const regexForMytagsSection = /mytags:\n([\s\S]*?)(?=^[a-zA-Z0-9_-]+:|^---|\Z)/m;
-    const matchExistingMytags = finalTemplate.match(regexForMytagsSection);
-
-    if (matchExistingMytags) {
-        const existingTags = matchExistingMytags[1];
-        finalTemplate = finalTemplate.replace(
-            regexForMytagsSection,
-            `mytags:\n${existingTags}${strOfMytags}`
-        );
-    } else if (/mytags:\s*\n?/i.test(finalTemplate)) {
-        finalTemplate = finalTemplate.replace(/mytags:\s*\n?/i, `mytags:\n${strOfMytags}`);
-    } else if (/^---\n[\s\S]*?\n---/m.test(finalTemplate)) {
-        finalTemplate = finalTemplate.replace(/\n---/, `\nmytags:\n${strOfMytags}---`);
+    // 2. up-Sektion (statt mytags)
+    const strOfUp = (mytagsList || []).map(tag => `  - "[[${tag}]]"\n`).join("");
+    if (strOfUp) {
+        const regexForUpSection = /^up:[ \t]*(?:\n((?:[ \t]+-.*(?:\n|$))*))?/m;
+        if (regexForUpSection.test(finalTemplate)) {
+            finalTemplate = finalTemplate.replace(regexForUpSection, (match, existing) => {
+                const existingLines = (existing || "")
+                    .split("\n")
+                    .filter(line => line.trim().length > 0 && !line.includes("<%"))
+                    .map(line => line + "\n")
+                    .join("");
+                return `up:\n${existingLines}${strOfUp}`;
+            });
+        } else if (/^---\n[\s\S]*?\n---/.test(finalTemplate)) {
+            finalTemplate = finalTemplate.replace(/\n---/, `\nup:\n${strOfUp}---`);
+        }
     }
 
     // 3. Aliases-Sektion
@@ -91,10 +92,15 @@ function createUpperPartOfTemplate(genericTemplateStart, mytagsList, aliases = n
         const regexForAliasesSection = /(\naliases:\n)([\s\S]*?)(?=^[a-zA-Z0-9_-]+:|^---|\Z)/m;
 
         if (regexForAliasesSection.test(finalTemplate)) {
-            finalTemplate = finalTemplate.replace(
-                regexForAliasesSection,
-                `$1$2${strOfAliases}`
-            );
+            finalTemplate = finalTemplate.replace(regexForAliasesSection, (match, p1, p2) => {
+                // Bereinige bestehende Zeilen von unaufgeloesten Templater-Tags wie <% tp.file.title.split... %>
+                const cleanedExisting = p2
+                    .split("\n")
+                    .filter(line => !line.includes("<%") && line.trim().length > 0)
+                    .map(line => line + "\n")
+                    .join("");
+                return `${p1}${cleanedExisting}${strOfAliases}`;
+            });
         } else if (/\naliases:\s*\n?/i.test(finalTemplate)) {
             finalTemplate = finalTemplate.replace(/\naliases:\s*\n?/i, `\naliases:\n${strOfAliases}`);
         } else if (/^---\n[\s\S]*?\n---/m.test(finalTemplate)) {
@@ -112,6 +118,64 @@ function cleanTitle(title) {
     // Entfernt ungueltige Zeichen fuer Obsidian-Dateinamen: \ / : | # ^ [ ] * ? " < >
     const safeTitle = noStructureNumbers.replace(/[\\/:|#^\[\]*?"<>]/g, "").trim();
     return safeTitle;
+}
+
+/**
+ * Fragt ab, unter welcher Ueberschrift des Templates der Text eingefuegt werden soll.
+ * Der Text landet direkt unter der gewaehlten Ueberschrift, alles danach im Template
+ * folgt unter dem Text. "Direkt nach den Metadaten" laesst das Template unveraendert geteilt.
+ *
+ * Optionen:
+ *   contentHeading     - Ueberschrift (Text ohne #) vorgeben, dann keine Abfrage
+ *   askContentHeading  - false = nicht abfragen
+ */
+async function chooseContentHeading(tp, options, templateStart, templateEnd) {
+    if (options.askContentHeading === false && !options.contentHeading) {
+        return { templateStart, templateEnd };
+    }
+
+    // Ueberschriften im Rest des Templates suchen (Code-Bloecke ignorieren)
+    const headings = [];
+    let offset = 0;
+    let inFence = false;
+    for (const line of templateEnd.split("\n")) {
+        const lineEnd = offset + line.length + 1; // inkl. Zeilenumbruch
+        if (/^\s*(```|~~~)/.test(line)) {
+            inFence = !inFence;
+        } else if (!inFence) {
+            const m = line.match(/^(#+)\s+(.*)$/);
+            if (m) headings.push({ label: `${m[1]} ${m[2].trim()}`, title: m[2].trim(), end: lineEnd });
+        }
+        offset = lineEnd;
+    }
+    // Reine Struktur-Ueberschriften sind kein Ziel fuer den Text -> nicht zur Auswahl anbieten.
+    // Bleibt keine uebrig, findet keine Abfrage statt.
+    const ignoredHeadings = (options.ignoredHeadings || ["Quellen", "Source", "Übungsaufgaben", "Unterthemen"])
+        .map(h => h.toLowerCase());
+    const selectable = headings.filter(h => !ignoredHeadings.includes(h.title.toLowerCase()));
+    if (selectable.length === 0) {
+        return { templateStart, templateEnd };
+    }
+
+    let chosen = null;
+    if (options.contentHeading) {
+        chosen = selectable.find(h => h.title === options.contentHeading) || null;
+    } else if (tp && tp.system) {
+        const labels = ["(Direkt nach den Metadaten)", ...selectable.map(h => h.label)];
+        const values = [null, ...selectable];
+        chosen = await tp.system.suggester(labels, values, false, "Unter welcher Überschrift soll der Text eingefügt werden?");
+    }
+    if (!chosen) {
+        return { templateStart, templateEnd };
+    }
+
+    const cut = Math.min(chosen.end, templateEnd.length);
+    let head = templateEnd.substring(0, cut);
+    if (!head.endsWith("\n")) head += "\n";
+    return {
+        templateStart: templateStart + head,
+        templateEnd: templateEnd.substring(cut)
+    };
 }
 
 async function resolveTemplate(app, tp, options) {
@@ -172,8 +236,23 @@ async function resolveTemplate(app, tp, options) {
             templateStart = content.substring(0, match.index);
             templateEnd = content.substring(match.index + match[0].length);
         } else {
-            templateStart = content;
-            templateEnd = "";
+            // Kein Marker: Template am Ende des Frontmatters teilen.
+            // -> Frontmatter = Start, Inhalt der Ueberschrift folgt direkt danach,
+            //    der Rest des Templates kommt unter den Inhalt.
+            const normalized = content.replace(/\r\n/g, "\n");
+            const fmMatch = normalized.match(/^---\n[\s\S]*?\n---[ \t]*(\n|$)/);
+            if (fmMatch) {
+                templateStart = fmMatch[0].endsWith("\n") ? fmMatch[0] : fmMatch[0] + "\n";
+                templateEnd = normalized.substring(fmMatch[0].length);
+            } else {
+                templateStart = normalized;
+                templateEnd = "";
+            }
+
+            // Abfrage: Unter welcher Ueberschrift des Templates soll der Text eingefuegt werden?
+            const split = await chooseContentHeading(tp, options, templateStart, templateEnd);
+            templateStart = split.templateStart;
+            templateEnd = split.templateEnd;
         }
         return { templateStart, templateEnd };
     }
@@ -184,7 +263,7 @@ async function resolveTemplate(app, tp, options) {
     return { templateStart, templateEnd };
 }
 
-async function createAtomicNotes(tp, options = {}) {
+module.exports = async function (tp, options = {}) {
     const app = tp.app || window.app;
 
     // 1. Quelldatei bestimmen
@@ -260,8 +339,8 @@ async function createAtomicNotes(tp, options = {}) {
             const title = match[2].trim();
             const currentLevel = hashes.length;
 
-            // Abbruchbedingung bei "Referenz" (analog zu exit() im Python-Code)
-            if (title === "Referenz") {
+            // Abbruchbedingung bei "Referenz" (analog zu exit() im Python-Code) bzw. options.stopHeadings
+            if ((options.stopHeadings || ["Referenz"]).includes(title)) {
                 break;
             }
 
@@ -280,6 +359,7 @@ async function createAtomicNotes(tp, options = {}) {
             usedFileNames.add(currentFileName);
 
             currentPath[currentLevel] = currentFileName;
+            console.log(currentPath);
 
             // Alle Ebenen unterhalb der aktuellen Ebene entfernen
             for (const k of Object.keys(currentPath)) {
@@ -295,15 +375,16 @@ async function createAtomicNotes(tp, options = {}) {
                 .sort((a, b) => a - b)
                 .map(k => currentPath[k]);
 
-            const existingTagsWithAliases = addAliasToListOfMytags(existingTags || []);
-            const parentTitlesWithAliases = addAliasToListOfMytags(parentTitles);
-            const combinedMytagsList = [...existingTagsWithAliases, ...parentTitlesWithAliases];
+            // Nur die direkt uebergeordnete Ueberschrift kommt in "up".
+            // Hat die Ueberschrift keinen Elternteil, wird (falls gewaehlt) das Oberthema verwendet.
+            const directParent = parentTitles.length > 0 ? [parentTitles[parentTitles.length - 1]] : (existingTags || []);
+            const upList = addAliasToListOfMytags(directParent);
 
-            let noteStartText = createUpperPartOfTemplate(templateStart, combinedMytagsList, [safeTitle]);
+            let noteStartText = createUpperPartOfTemplate(templateStart, upList, [safeTitle]);
 
-            // Templater-Titel ersetzen
-            noteStartText = noteStartText.replaceAll("<% tp.file.title %>", currentFileName);
-            noteStartText = noteStartText.replaceAll("<%tp.file.title%>", currentFileName);
+            // Templater-Titel ersetzen (sowohl vollstaendiger Name als auch bereinigter Alias)
+            noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, safeTitle);
+            noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\s*%>/gi, currentFileName);
 
             const filePath = targetFolder ? `${targetFolder}/${currentFileName}.md` : `${currentFileName}.md`;
 
@@ -328,17 +409,20 @@ async function createAtomicNotes(tp, options = {}) {
     // 7. Notizen im Vault erstellen
     let createdCount = 0;
     for (const note of notes) {
-        let body = note.bodyLines.join("\n");
-        if (body.length > 0 && !body.startsWith("\n")) {
-            body = "\n" + body;
-        }
+        const body = note.bodyLines.join("\n").trim();
 
-        let fullText = note.startText;
-        if (body.trim().length > 0) {
-            fullText += body;
+        let fullText = note.startText.replace(/\n*$/, "\n");
+        if (body.length > 0) {
+            fullText += body + "\n";
         }
         if (templateEnd && templateEnd.trim().length > 0) {
-            fullText += (fullText.endsWith("\n") ? "" : "\n") + templateEnd;
+            const stamp = window.moment ? window.moment().format("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE");
+            const endText = templateEnd
+                .replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, note.fileName.split(" - ").slice(1).join(" - "))
+                .replace(/<%\s*tp\.file\.title\s*%>/gi, note.fileName)
+                .replace(/<%\s*tp\.date\.now\(\s*["']DD\.MM\.YYYY HH:mm["']\s*\)\s*%>/gi, stamp);
+            if (fullText)
+            fullText += "\n" + endText.replace(/^\n+/, "");
         }
 
         try {
@@ -357,13 +441,3 @@ async function createAtomicNotes(tp, options = {}) {
     new Notice(`✅ ${createdCount} atomare Notizen erfolgreich erstellt!`);
     return "";
 }
-
-// Export der Hauptfunktion und Einzelfunktionen fuer maximale Flexibilitaet
-createAtomicNotes.deleteMetadataInString = deleteMetadataInString;
-createAtomicNotes.checkIfStringContainsHeadlines = checkIfStringContainsHeadlines;
-createAtomicNotes.addAliasToListOfMytags = addAliasToListOfMytags;
-createAtomicNotes.createUpperPartOfTemplate = createUpperPartOfTemplate;
-createAtomicNotes.cleanTitle = cleanTitle;
-createAtomicNotes.createNotesFromBigNote = createAtomicNotes;
-
-module.exports = { createAtomicNotes };
