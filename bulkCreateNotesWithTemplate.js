@@ -73,6 +73,9 @@ if (templateFile) {
 	        const noteNameWithAlias = upTopic.basename + aliasOfNote;
             finalContent = finalContent.replaceAll("up: ", `up: \n- "[[${noteNameWithAlias}]]"`);
 
+            // Ensure #addedByCode tag is added in the created note's frontmatter
+            finalContent = addTagToFrontmatter(finalContent, "addedByCode");
+
             try {
                 await app.vault.create(`${fileName}.md`, finalContent);
             } catch (error) {
@@ -88,3 +91,60 @@ if (templateFile) {
     new Notice("Abgebrochen: Kein Template ausgewählt.");
 }
 };
+
+function addTagToFrontmatter(content, tag = "addedByCode") {
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    if (!fmMatch) {
+        return `---\ntags:\n  - ${tag}\n---\n${content}`;
+    }
+
+    const frontmatter = fmMatch[1];
+    // Avoid duplicate tag
+    const tagPattern = new RegExp(`(^|[\\s,\\["'])${tag}(["'\\]\\s]|$)`, "i");
+    if (tagPattern.test(frontmatter)) {
+        return content;
+    }
+
+    // 1. Inline list: tags: [a, b] or tags: []
+    const inlineListRegex = /^tags:[ \t]*\[(.*?)\][ \t]*$/m;
+    if (inlineListRegex.test(frontmatter)) {
+        const updatedFm = frontmatter.replace(inlineListRegex, (match, inner) => {
+            const trimmed = inner.trim();
+            return trimmed.length > 0 ? `tags: [${trimmed}, ${tag}]` : `tags: [${tag}]`;
+        });
+        return content.replace(/^---\r?\n[\s\S]*?\r?\n---/, `---\n${updatedFm}\n---`);
+    }
+
+    // 2. Multiline list with existing items: tags:\n  - ...
+    const tagsListRegex = /^tags:[ \t]*\r?\n((?:[ \t]+-.*(?:\r?\n|$))+)/m;
+    if (tagsListRegex.test(frontmatter)) {
+        const updatedFm = frontmatter.replace(tagsListRegex, (match, existing) => {
+            const existingLines = existing
+                .split(/\r?\n/)
+                .filter(line => line.trim().length > 0 && !line.includes("<%"))
+                .map(line => line + "\n")
+                .join("");
+            return `tags:\n${existingLines}  - ${tag}\n`;
+        });
+        return content.replace(/^---\r?\n[\s\S]*?\r?\n---/, `---\n${updatedFm}\n---`);
+    }
+
+    // 3. Empty tags key: tags: on its own line
+    const emptyTagsRegex = /^tags:[ \t]*$/m;
+    if (emptyTagsRegex.test(frontmatter)) {
+        const updatedFm = frontmatter.replace(emptyTagsRegex, `tags:\n  - ${tag}`);
+        return content.replace(/^---\r?\n[\s\S]*?\r?\n---/, `---\n${updatedFm}\n---`);
+    }
+
+    // 4. Single value on same line: tags: someTag
+    const singleTagRegex = /^tags:[ \t]+([^\r\n\[]+)$/m;
+    if (singleTagRegex.test(frontmatter)) {
+        const updatedFm = frontmatter.replace(singleTagRegex, (match, val) => {
+            return `tags:\n  - ${val.trim()}\n  - ${tag}`;
+        });
+        return content.replace(/^---\r?\n[\s\S]*?\r?\n---/, `---\n${updatedFm}\n---`);
+    }
+
+    // 5. tags: key does not exist at all -> insert before closing ---
+    return content.replace(/\r?\n---/, `\ntags:\n  - ${tag}\n---`);
+}
