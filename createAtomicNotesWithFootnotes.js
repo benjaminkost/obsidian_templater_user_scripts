@@ -22,10 +22,12 @@
 const PDF_LINK_REGEX = /(?<!!)\[\[([^\]|#\n]*?\.pdf(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?)\]\]/gi;
 
 function convertPdfLinksToFootnotes(body) {
-    // First normalize any raw "file.pdf > page=10" links into "[[file.pdf#page=10]]"
+    // First normalize any raw or escaped PDF references into clean "[[file.pdf...]]" wikilinks
     const normalizedBody = body
-        .replace(/\[\[([^\]\r\n]+\.pdf)\]\]\s*>\s*page\s*=\s*(\d+)/gi, "[[$1#page=$2]]")
-        .replace(/(?<!\[\[)([^\s\[\]\(\)<>"'#|*?:]+\.pdf)\s*>\s*page\s*=\s*(\d+)(?!\]\])/gi, "[[$1#page=$2]]");
+        .replace(/(?:\\\[|\[){2}([^\]\r\n]+\.pdf)(?:\\\]|\]){2}\s*>\s*page\s*=\s*(\d+)/gi, "[[$1#page=$2]]")
+        .replace(/\\\[\\\[([^\]\r\n]+\.pdf(?:#[^\]\r\n]+)?(?:\|[^\]\r\n]+)?)\\\]\\\]/gi, "[[$1]]")
+        .replace(/(?:\\\[\[|\[\\\[)([^\]\r\n]+\.pdf(?:#[^\]\r\n]+)?(?:\|[^\]\r\n]+)?)(?:\\\]\]|\]\\\])/gi, "[[$1]]")
+        .replace(/(?<!\[\[)(?<!\\\[\\\[)([^\s\[\]\(\)<>"'#|*?:]+\.pdf)\s*>\s*page\s*=\s*(\d+)(?!\]\])(?!\\\]\\\])/gi, "[[$1#page=$2]]");
 
     // Continue after the highest existing footnote number to avoid collisions
     let counter = 0;
