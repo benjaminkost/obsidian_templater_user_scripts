@@ -22,6 +22,11 @@
 const PDF_LINK_REGEX = /(?<!!)\[\[([^\]|#\n]*?\.pdf(?:#[^\]|\n]*)?(?:\|[^\]\n]*)?)\]\]/gi;
 
 function convertPdfLinksToFootnotes(body) {
+    // First normalize any raw "file.pdf > page=10" links into "[[file.pdf#page=10]]"
+    const normalizedBody = body
+        .replace(/\[\[([^\]\r\n]+\.pdf)\]\]\s*>\s*page\s*=\s*(\d+)/gi, "[[$1#page=$2]]")
+        .replace(/(?<!\[\[)([^\s\[\]\(\)<>"'#|*?:]+\.pdf)\s*>\s*page\s*=\s*(\d+)(?!\]\])/gi, "[[$1#page=$2]]");
+
     // Continue after the highest existing footnote number to avoid collisions
     let counter = 0;
     for (const m of body.matchAll(/\[\^(\d+)\]/g)) {
@@ -32,7 +37,7 @@ function convertPdfLinksToFootnotes(body) {
     const definitions = [];
     let inFence = false;
 
-    const lines = body.split("\n").map(line => {
+    const lines = normalizedBody.split("\n").map(line => {
         // Do not touch code blocks
         if (/^\s*(```|~~~)/.test(line)) {
             inFence = !inFence;
