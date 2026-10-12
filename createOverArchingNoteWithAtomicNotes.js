@@ -8,13 +8,14 @@
  *  - The text used for the notes is then deleted from the open file
  *    (from the first heading up to "Übungsaufgaben"/"Quellen"/...). In its place,
  *    the section "# Unterthemen" with a Dataview query is inserted.
- *    With deleteSourceText: false the text is kept and the section is only added.
+ *  - Lets the user define up to which heading level (e.g. H1, H2, H3, ...) new notes should be created.
+ *    Sub-headings deeper than the chosen level remain inside their parent note's body.
  *
  * Usage:
  *   <%* await tp.user.createOverArchingNoteWithAtomicNotes(tp) -%>
  *
  * Options (passed on to createAtomicNotes):
- *   templateFile, targetFolder, sourceFile, deleteSourceText, ...
+ *   maxLevel (1-6), templateFile, targetFolder, sourceFile, deleteSourceText, ...
  */
 
 function buildUnterthemenBlock() {
@@ -52,11 +53,39 @@ module.exports = async function (tp, options = {}) {
         return;
     }
 
+    // Ask user for maximum heading level for note creation (if not specified in options)
+    let maxLevel = options.maxLevel ?? options.maxHeadingLevel;
+    if (maxLevel === undefined && tp.system) {
+        const levelChoices = [
+            "Alle Ebenen (# bis ######) [Standard]",
+            "Ebene 1 (#) - Nur H1",
+            "Ebene 2 (##) - Bis H2",
+            "Ebene 3 (###) - Bis H3",
+            "Ebene 4 (####) - Bis H4",
+            "Ebene 5 (#####) - Bis H5"
+        ];
+        const levelValues = [6, 1, 2, 3, 4, 5];
+
+        const chosen = await tp.system.suggester(
+            levelChoices,
+            levelValues,
+            false,
+            "Bis zu welchem Überschriften-Niveau sollen neue Notizen erstellt werden?"
+        );
+
+        if (chosen === undefined || chosen === null) {
+            new Notice("Abgebrochen: Kein Überschriften-Niveau ausgewählt.");
+            return;
+        }
+        maxLevel = chosen;
+    }
+
     // Create atomic notes; the open note is set as "up" of the top level.
     // "Übungsaufgaben", "Quellen" and "Unterthemen" are not topics and are not split.
     const stopHeadings = options.stopHeadings || ["Übungsaufgaben", "Quellen", "Referenz", "Unterthemen"];
     const result = await tp.user.createAtomicNotes(tp, {
         ...options,
+        maxLevel,
         stopHeadings,
         sourceFile: openFile,
         existingTags: [openFile.basename],

@@ -111,7 +111,7 @@ function addTagToFrontmatter(content, tag = "addedByCode") {
 
 function createUpperPartOfTemplate(genericTemplateStart, mytagsList, aliases = null) {
     let finalTemplate = genericTemplateStart || "";
-    const timestamp = window.moment ? window.moment().format("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE");
+    const timestamp = (typeof window !== "undefined" && window.moment) ? window.moment().format("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE");
 
     // 1. Timestamp ("created date:", "created date": or created date:)
     const createdDateRegex = /\n["']?created date:?["']?:?\s*.*(\n|$)/i;
@@ -322,6 +322,56 @@ async function resolveTemplate(app, tp, options) {
     templateEnd = "";
     return { templateStart, templateEnd };
 }
+/**
+ * Normalizes headings in a note body so that the highest sub-heading
+ * starts with '#' (level 1), keeping the relative hierarchy intact.
+ * Code blocks (``` or ~~~) are protected.
+ *
+ * @param {string[]} bodyLines - Lines of the note body.
+ * @returns {string[]} Adjusted lines.
+ */
+function renormalizeHeadingsInBodyLines(bodyLines) {
+    if (!bodyLines || bodyLines.length === 0) return bodyLines;
+
+    let inFence = false;
+    let minLevel = Infinity;
+
+    // First pass: find minimum heading level outside code blocks
+    for (const line of bodyLines) {
+        if (/^\s*(```|~~~)/.test(line)) {
+            inFence = !inFence;
+            continue;
+        }
+        if (inFence) continue;
+
+        const m = line.match(/^(#{1,6})\s+(.*)$/);
+        if (m) {
+            minLevel = Math.min(minLevel, m[1].length);
+        }
+    }
+
+    if (minLevel === Infinity || minLevel <= 1) {
+        return bodyLines;
+    }
+
+    const shift = minLevel - 1;
+    inFence = false;
+
+    return bodyLines.map(line => {
+        if (/^\s*(```|~~~)/.test(line)) {
+            inFence = !inFence;
+            return line;
+        }
+        if (inFence) return line;
+
+        const m = line.match(/^(#{1,6})\s+(.*)$/);
+        if (m) {
+            const newHashes = "#".repeat(m[1].length - shift);
+            return `${newHashes} ${m[2]}`;
+        }
+        return line;
+    });
+}
 
 module.exports = async function (tp, options = {}) {
     const app = tp.app || window.app;
@@ -384,14 +434,34 @@ module.exports = async function (tp, options = {}) {
     }
 
     // 6. Iterate over lines and build the hierarchy
+    const maxLevel = options.maxLevel !== undefined
+        ? Number(options.maxLevel)
+        : (options.maxHeadingLevel !== undefined ? Number(options.maxHeadingLevel) : 6);
+
     const lines = fileStr.split("\n");
     const regexForHeadlineTitle = /^(#+)\s+(.*)/;
     const currentPath = {};
     const notes = [];
     let currentNote = null;
     const usedFileNames = new Set();
+    let inFence = false;
 
     for (const line of lines) {
+        // Protect code blocks (``` or ~~~) so headings/comments inside them are not treated as markdown headlines
+        if (/^\s*(```|~~~)/.test(line)) {
+            inFence = !inFence;
+            if (currentNote) {
+                currentNote.bodyLines.push(line);
+            }
+            continue;
+        }
+        if (inFence) {
+            if (currentNote) {
+                currentNote.bodyLines.push(line);
+            }
+            continue;
+        }
+
         const match = line.match(regexForHeadlineTitle);
 
         if (match) {
@@ -404,7 +474,15 @@ module.exports = async function (tp, options = {}) {
                 break;
             }
 
-            const timestamp = window.moment ? window.moment().format("YYYYMMDDHHmm") : tp.date.now("YYYYMMDDHHmm");
+            // If heading level exceeds maxLevel, keep it inside the current note's body rather than creating a new note
+            if (currentLevel > maxLevel) {
+                if (currentNote) {
+                    currentNote.bodyLines.push(line);
+                }
+                continue;
+            }
+
+            const timestamp = (typeof window !== "undefined" && window.moment) ? window.moment().format("YYYYMMDDHHmm") : (tp.date ? tp.date.now("YYYYMMDDHHmm") : "");
             const safeTitle = cleanTitle(title);
 
             let currentFileName = `${timestamp} - ${safeTitle}`;
@@ -468,8 +546,14 @@ module.exports = async function (tp, options = {}) {
 
     // 7. Create notes in the vault
     let createdCount = 0;
+    const relevelHeadings = options.relevelHeadings !== false;
+
     for (const note of notes) {
-        let body = note.bodyLines.join("\n").trim();
+        let linesToProcess = note.bodyLines;
+        if (relevelHeadings) {
+            linesToProcess = renormalizeHeadingsInBodyLines(linesToProcess);
+        }
+        let body = linesToProcess.join("\n").trim();
         let footer = "";
         // Optional hook: transformBody(body) returns { text, footer } (footer is appended at the end of the note)
         if (typeof options.transformBody === "function") {
@@ -483,7 +567,7 @@ module.exports = async function (tp, options = {}) {
             fullText += body + "\n";
         }
         if (templateEnd && templateEnd.trim().length > 0) {
-            const stamp = window.moment ? window.moment().format("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE");
+            const stamp = (typeof window !== "undefined" && window.moment) ? window.moment().format("DD.MM.YYYY HH:mm") : (tp.date ? tp.date.now("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE"));
             const endText = templateEnd
                 .replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, note.fileName.split(" - ").slice(1).join(" - "))
                 .replace(/<%\s*tp\.file\.title\s*%>/gi, note.fileName)
