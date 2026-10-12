@@ -5,17 +5,17 @@
  * with these differences:
  *  - The open note is the overarching note: atomic notes without a parent of their own
  *    (top heading level) get it as "up".
- *  - The text used for the notes is then deleted from the open file
- *    (from the first heading up to "Übungsaufgaben"/"Quellen"/...). In its place,
- *    the section "# Unterthemen" with a Dataview query is inserted.
  *  - Lets the user define up to which heading level (e.g. H1, H2, H3, ...) new notes should be created.
- *    Sub-headings deeper than the chosen level remain inside their parent note's body.
+ *    Sub-headings deeper than the chosen level remain inside their parent note's body (starting at #).
+ *  - Lets the user choose how contents in the overarching note should be handled:
+ *    1) Default: Delete transferred text and insert the "# Unterthemen" Dataview block.
+ *    2) Optional: Keep the heading hierarchy and link paragraphs via block references (![[Note#^id]]).
  *
  * Usage:
  *   <%* await tp.user.createOverArchingNoteWithAtomicNotes(tp) -%>
  *
  * Options (passed on to createAtomicNotes):
- *   maxLevel (1-6), templateFile, targetFolder, sourceFile, deleteSourceText, ...
+ *   maxLevel (1-6), useBlockReferences (boolean, default: false), templateFile, targetFolder, sourceFile, ...
  */
 
 function buildUnterthemenBlock() {
@@ -80,21 +80,71 @@ module.exports = async function (tp, options = {}) {
         maxLevel = chosen;
     }
 
-    // Create atomic notes; the open note is set as "up" of the top level.
+    // Ask user whether to delete transferred content (default) or keep block references
+    let useBlockReferences = options.useBlockReferences;
+    if (useBlockReferences === undefined && tp.system) {
+        const modeChoices = [
+            "Inhalte löschen & '# Unterthemen' (Dataview) einfügen [Standard]",
+            "Inhalte als Paragraphen-Referenzen (![[Notiz#^id]]) beibehalten"
+        ];
+        const modeValues = [false, true];
+
+        const chosenMode = await tp.system.suggester(
+            modeChoices,
+            modeValues,
+            false,
+            "Wie sollen die Inhalte in der ursprünglichen Notiz behandelt werden?"
+        );
+
+        if (chosenMode === undefined || chosenMode === null) {
+            new Notice("Abgebrochen: Keine Auswahl getroffen.");
+            return;
+        }
+        useBlockReferences = chosenMode;
+    } else if (useBlockReferences === undefined) {
+        useBlockReferences = false; // Default: false
+    }
+
+    // Create atomic notes
+    // The open note is set as "up" for top-level notes.
     // "Übungsaufgaben", "Quellen" and "Unterthemen" are not topics and are not split.
     const stopHeadings = options.stopHeadings || ["Übungsaufgaben", "Quellen", "Referenz", "Unterthemen"];
+
     const result = await tp.user.createAtomicNotes(tp, {
         ...options,
+        useBlockReferences,
         maxLevel,
         stopHeadings,
         sourceFile: openFile,
         existingTags: [openFile.basename],
-        skipPrompt: true
+        skipPrompt: true,
+        silent: true
     });
 
     // createAtomicNotes returns undefined on abort (e.g. no headings)
-    if (result === undefined) return;
+    if (!result || !result.createdCount) return;
 
+    if (useBlockReferences && result.overarchingContent) {
+        let finalContent = result.overarchingContent;
+        const hasUnterthemen = /^#\s+Unterthemen\s*$/m.test(finalContent);
+        if (!hasUnterthemen) {
+            const block = buildUnterthemenBlock();
+            const anchor = finalContent.match(/^#+\s+(\d+[\.\-_)]?\s*)?Übungsaufgaben\s*$/m) ||
+                           finalContent.match(/^#+\s+(\d+[\.\-_)]?\s*)?Quellen\s*$/m);
+            if (anchor) {
+                finalContent = finalContent.slice(0, anchor.index) + block + "\n" + finalContent.slice(anchor.index);
+            } else {
+                const separator = finalContent.endsWith("\n") ? "\n" : "\n\n";
+                finalContent = finalContent + separator + block;
+            }
+        }
+
+        await app.vault.modify(openFile, finalContent);
+        new Notice(`✅ ${result.createdCount} atomare Notizen erstellt und Inhalte als Paragraphen-Referenzen verlinkt!`);
+        return "";
+    }
+
+    // Fallback if useBlockReferences: false (Default mode: delete transferred content & insert Dataview)
     const content = (await app.vault.read(openFile)).replace(/\r\n/g, "\n");
     const hasUnterthemen = /^#\s+Unterthemen\s*$/m.test(content);
     const block = buildUnterthemenBlock();
@@ -114,7 +164,9 @@ module.exports = async function (tp, options = {}) {
         let m;
         while ((m = headingRegex.exec(body)) !== null) {
             if (firstIdx === -1) firstIdx = m.index;
-            if (stopHeadings.includes(m[2].trim())) {
+            const headingTitle = m[2].trim();
+            const cleanHeading = headingTitle.replace(/^(\d+[\.\-_)]?)+\s*/, "").trim();
+            if (stopHeadings.includes(headingTitle) || stopHeadings.includes(cleanHeading)) {
                 stopIdx = m.index;
                 break;
             }
@@ -131,8 +183,8 @@ module.exports = async function (tp, options = {}) {
         new Notice("ℹ️ Abschnitt '# Unterthemen' ist bereits vorhanden.");
         return "";
     } else {
-        // Insert before "# Übungsaufgaben", otherwise before "# Quellen", otherwise at the end
-        const anchor = content.match(/^#\s+Übungsaufgaben\s*$/m) || content.match(/^#\s+Quellen\s*$/m);
+        const anchor = content.match(/^#+\s+(\d+[\.\-_)]?\s*)?Übungsaufgaben\s*$/m) ||
+                       content.match(/^#+\s+(\d+[\.\-_)]?\s*)?Quellen\s*$/m);
         if (anchor) {
             newContent = content.slice(0, anchor.index) + block + "\n" + content.slice(anchor.index);
         } else {
@@ -143,7 +195,7 @@ module.exports = async function (tp, options = {}) {
 
     await app.vault.modify(openFile, newContent);
     new Notice(deleteSourceText
-        ? "✅ Text in atomare Notizen überführt und aus der Datei entfernt."
+        ? `✅ Text in ${result.createdCount} atomare Notizen überführt und aus der Datei entfernt.`
         : "✅ Abschnitt '# Unterthemen' hinzugefügt.");
     return "";
 };

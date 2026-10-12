@@ -373,6 +373,160 @@ function renormalizeHeadingsInBodyLines(bodyLines) {
     });
 }
 
+function generateBlockId() {
+    return Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+}
+
+function parseBlocksFromLines(lines) {
+    const blocks = [];
+    let i = 0;
+    const n = lines.length;
+
+    while (i < n) {
+        const line = lines[i];
+
+        // Empty line
+        if (/^\s*$/.test(line)) {
+            blocks.push({ type: "empty", lines: [line] });
+            i++;
+            continue;
+        }
+
+        // Horizontal divider / thematic break
+        if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+            blocks.push({ type: "divider", lines: [line] });
+            i++;
+            continue;
+        }
+
+        // Code block (fenced by ``` or ~~~)
+        if (/^\s*(```|~~~)/.test(line)) {
+            const fence = line.match(/^\s*(```|~~~)/)[1];
+            const blockLines = [line];
+            i++;
+            while (i < n) {
+                blockLines.push(lines[i]);
+                if (lines[i].trim().startsWith(fence)) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            let existingId = null;
+            if (i < n && /^\^([a-zA-Z0-9_-]+)\s*$/.test(lines[i])) {
+                existingId = lines[i].match(/^\^([a-zA-Z0-9_-]+)/)[1];
+                i++;
+            }
+            blocks.push({ type: "code", lines: blockLines, existingId });
+            continue;
+        }
+
+        // Display math block ($$ ... $$)
+        if (/^\s*\$\$/.test(line)) {
+            const blockLines = [line];
+            i++;
+            while (i < n) {
+                blockLines.push(lines[i]);
+                if (/^\s*\$\$/.test(lines[i])) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            let existingId = null;
+            if (i < n && /^\^([a-zA-Z0-9_-]+)\s*$/.test(lines[i])) {
+                existingId = lines[i].match(/^\^([a-zA-Z0-9_-]+)/)[1];
+                i++;
+            }
+            blocks.push({ type: "math", lines: blockLines, existingId });
+            continue;
+        }
+
+        // Heading
+        const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+        if (headingMatch) {
+            blocks.push({
+                type: "heading",
+                lines: [line],
+                level: headingMatch[1].length,
+                title: headingMatch[2].trim()
+            });
+            i++;
+            continue;
+        }
+
+        // Markdown Table
+        if (/^\s*\|/.test(line)) {
+            const blockLines = [line];
+            i++;
+            while (i < n && /^\s*\|/.test(lines[i])) {
+                blockLines.push(lines[i]);
+                i++;
+            }
+            blocks.push({ type: "table", lines: blockLines });
+            continue;
+        }
+
+        // Blockquote / Callout (> ...)
+        if (/^\s*>/.test(line)) {
+            const blockLines = [line];
+            i++;
+            while (i < n && (/^\s*>/.test(lines[i]) || (/^\s*$/.test(lines[i]) && i + 1 < n && /^\s*>/.test(lines[i + 1])))) {
+                blockLines.push(lines[i]);
+                i++;
+            }
+            blocks.push({ type: "quote", lines: blockLines });
+            continue;
+        }
+
+        // List item (bulleted or numbered, including indented continuation lines)
+        const listMatch = line.match(/^(\s*)([-*+]|\d+[.)])\s+/);
+        if (listMatch) {
+            const baseIndent = listMatch[1].length;
+            const blockLines = [line];
+            i++;
+            while (i < n) {
+                const nextLine = lines[i];
+                if (/^\s*$/.test(nextLine)) break;
+                if (/^(#{1,6})\s+/.test(nextLine)) break;
+                if (/^\s*(```|~~~)/.test(nextLine)) break;
+                if (/^\s*\$\$/.test(nextLine)) break;
+                if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(nextLine)) break;
+                const nextListMatch = nextLine.match(/^(\s*)([-*+]|\d+[.)])\s+/);
+                if (nextListMatch) break;
+                const nextIndent = nextLine.match(/^(\s*)/)[1].length;
+                if (nextIndent > baseIndent) {
+                    blockLines.push(nextLine);
+                    i++;
+                } else {
+                    break;
+                }
+            }
+            blocks.push({ type: "list-item", lines: blockLines });
+            continue;
+        }
+
+        // Regular paragraph (contiguous non-empty lines until blank line, heading, code block, etc.)
+        const blockLines = [line];
+        i++;
+        while (i < n) {
+            const nextLine = lines[i];
+            if (/^\s*$/.test(nextLine)) break;
+            if (/^(#{1,6})\s+/.test(nextLine)) break;
+            if (/^\s*(```|~~~)/.test(nextLine)) break;
+            if (/^\s*\$\$/.test(nextLine)) break;
+            if (/^\s*\|/.test(nextLine)) break;
+            if (/^\s*>/.test(nextLine)) break;
+            if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(nextLine)) break;
+            if (/^\s*([-*+]|\d+[.)])\s+/.test(nextLine)) break;
+            blockLines.push(nextLine);
+            i++;
+        }
+        blocks.push({ type: "paragraph", lines: blockLines });
+    }
+    return blocks;
+}
+
 module.exports = async function (tp, options = {}) {
     const app = tp.app || window.app;
 
@@ -422,120 +576,171 @@ module.exports = async function (tp, options = {}) {
     // 4. Target folder (default: vault root, as in the Python script)
     const targetFolder = (options.targetFolder !== undefined) ? options.targetFolder.replace(/\/+$/, "") : "";
 
-    // 5. Read and clean the source file
-    let fileStr = (await app.vault.read(sourceFile)).replace(/\r\n/g, "\n");
-    fileStr = deleteMetadataInString(fileStr);
+    // 5. Read source file, preserve frontmatter, and check for headlines
+    const fullSourceStr = (await app.vault.read(sourceFile)).replace(/\r\n/g, "\n");
+    const fmMatch = fullSourceStr.match(/^---\n[\s\S]*?\n---[ \t]*(\n|$)/);
+    const frontmatter = fmMatch ? fmMatch[0] : "";
+    const bodyStr = fullSourceStr.slice(frontmatter.length);
 
     try {
-        checkIfStringContainsHeadlines(fileStr);
+        checkIfStringContainsHeadlines(bodyStr);
     } catch (e) {
         new Notice(`❌ ${e.message}`);
         return;
     }
 
-    // 6. Iterate over lines and build the hierarchy
+    // 6. Parse blocks and build atomic notes + overarching content
     const maxLevel = options.maxLevel !== undefined
         ? Number(options.maxLevel)
         : (options.maxHeadingLevel !== undefined ? Number(options.maxHeadingLevel) : 6);
+    const useBlockReferences = options.useBlockReferences === true;
+    const stopHeadings = options.stopHeadings || ["Referenz"];
 
-    const lines = fileStr.split("\n");
-    const regexForHeadlineTitle = /^(#+)\s+(.*)/;
+    const blocks = parseBlocksFromLines(bodyStr.split("\n"));
     const currentPath = {};
     const notes = [];
     let currentNote = null;
     const usedFileNames = new Set();
-    let inFence = false;
+    const overarchingBodyLines = [];
+    let stopReached = false;
 
-    for (const line of lines) {
-        // Protect code blocks (``` or ~~~) so headings/comments inside them are not treated as markdown headlines
-        if (/^\s*(```|~~~)/.test(line)) {
-            inFence = !inFence;
-            if (currentNote) {
-                currentNote.bodyLines.push(line);
-            }
-            continue;
-        }
-        if (inFence) {
-            if (currentNote) {
-                currentNote.bodyLines.push(line);
+    for (let b = 0; b < blocks.length; b++) {
+        const block = blocks[b];
+
+        if (stopReached) {
+            if (useBlockReferences) {
+                overarchingBodyLines.push(...block.lines);
             }
             continue;
         }
 
-        const match = line.match(regexForHeadlineTitle);
-
-        if (match) {
-            const hashes = match[1];
-            const title = match[2].trim();
-            const currentLevel = hashes.length;
-
-            // Stop condition at "Referenz" (like exit() in the Python code) or options.stopHeadings
-            if ((options.stopHeadings || ["Referenz"]).includes(title)) {
-                break;
-            }
-
-            // If heading level exceeds maxLevel, keep it inside the current note's body rather than creating a new note
-            if (currentLevel > maxLevel) {
-                if (currentNote) {
-                    currentNote.bodyLines.push(line);
+        if (block.type === "heading") {
+            const clean = cleanTitle(block.title);
+            if (stopHeadings.includes(block.title) || stopHeadings.includes(clean)) {
+                stopReached = true;
+                if (useBlockReferences) {
+                    overarchingBodyLines.push(...block.lines);
                 }
                 continue;
             }
 
-            const timestamp = (typeof window !== "undefined" && window.moment) ? window.moment().format("YYYYMMDDHHmm") : (tp.date ? tp.date.now("YYYYMMDDHHmm") : "");
-            const safeTitle = cleanTitle(title);
+            if (block.level <= maxLevel) {
+                const timestamp = (typeof window !== "undefined" && window.moment)
+                    ? window.moment().format("YYYYMMDDHHmm")
+                    : (tp.date ? tp.date.now("YYYYMMDDHHmm") : "");
+                const safeTitle = cleanTitle(block.title);
 
-            let currentFileName = `${timestamp} - ${safeTitle}`;
-            let counter = 1;
-            while (
-                usedFileNames.has(currentFileName) ||
-                app.vault.getAbstractFileByPath(targetFolder ? `${targetFolder}/${currentFileName}.md` : `${currentFileName}.md`)
-            ) {
-                currentFileName = `${timestamp} - ${safeTitle} (${counter})`;
-                counter++;
-            }
-            usedFileNames.add(currentFileName);
+                let currentFileName = `${timestamp} - ${safeTitle}`;
+                let counter = 1;
+                while (
+                    usedFileNames.has(currentFileName) ||
+                    app.vault.getAbstractFileByPath(targetFolder ? `${targetFolder}/${currentFileName}.md` : `${currentFileName}.md`)
+                ) {
+                    currentFileName = `${timestamp} - ${safeTitle} (${counter})`;
+                    counter++;
+                }
+                usedFileNames.add(currentFileName);
 
-            currentPath[currentLevel] = currentFileName;
-            console.log(currentPath);
+                currentPath[block.level] = currentFileName;
 
-            // Remove all levels below the current level
-            for (const k of Object.keys(currentPath)) {
-                if (Number(k) > currentLevel) {
-                    delete currentPath[k];
+                // Remove all levels below current level
+                for (const k of Object.keys(currentPath)) {
+                    if (Number(k) > block.level) {
+                        delete currentPath[k];
+                    }
+                }
+
+                // Determine parent titles (all levels < block.level)
+                const parentTitles = Object.keys(currentPath)
+                    .map(Number)
+                    .filter(k => k < block.level)
+                    .sort((a, b) => a - b)
+                    .map(k => currentPath[k]);
+
+                // Direct parent heading in "up". If top level, existingTags (parent topic)
+                const directParent = parentTitles.length > 0 ? [parentTitles[parentTitles.length - 1]] : (existingTags || []);
+                const upList = addAliasToListOfMytags(directParent);
+
+                let noteStartText = createUpperPartOfTemplate(templateStart, upList, [safeTitle]);
+
+                // Replace Templater title placeholders
+                noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, safeTitle);
+                noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\s*%>/gi, currentFileName);
+
+                const filePath = targetFolder ? `${targetFolder}/${currentFileName}.md` : `${currentFileName}.md`;
+
+                currentNote = {
+                    fileName: currentFileName,
+                    path: filePath,
+                    startText: noteStartText,
+                    bodyLines: []
+                };
+                notes.push(currentNote);
+
+                if (useBlockReferences) {
+                    overarchingBodyLines.push(block.lines[0]);
+                }
+            } else {
+                // Sub-heading deeper than maxLevel
+                if (currentNote) {
+                    currentNote.bodyLines.push(block.lines[0]);
+                }
+                if (useBlockReferences) {
+                    overarchingBodyLines.push(block.lines[0]);
                 }
             }
+            continue;
+        }
 
-            // Determine parent titles (all levels < currentLevel)
-            const parentTitles = Object.keys(currentPath)
-                .map(Number)
-                .filter(k => k < currentLevel)
-                .sort((a, b) => a - b)
-                .map(k => currentPath[k]);
+        if (block.type === "empty") {
+            if (currentNote) {
+                const last = currentNote.bodyLines[currentNote.bodyLines.length - 1];
+                if (last !== "") currentNote.bodyLines.push("");
+            }
+            if (useBlockReferences) {
+                const last = overarchingBodyLines[overarchingBodyLines.length - 1];
+                if (last !== "") overarchingBodyLines.push("");
+            }
+            continue;
+        }
 
-            // Only the direct parent heading goes into "up".
-            // If the heading has no parent, the parent topic (if chosen) is used.
-            const directParent = parentTitles.length > 0 ? [parentTitles[parentTitles.length - 1]] : (existingTags || []);
-            const upList = addAliasToListOfMytags(directParent);
+        if (block.type === "divider") {
+            if (currentNote) {
+                currentNote.bodyLines.push(...block.lines);
+            }
+            if (useBlockReferences) {
+                overarchingBodyLines.push(...block.lines);
+            }
+            continue;
+        }
 
-            let noteStartText = createUpperPartOfTemplate(templateStart, upList, [safeTitle]);
+        // Preamble text before any heading
+        if (!currentNote) {
+            if (useBlockReferences) {
+                overarchingBodyLines.push(...block.lines);
+            }
+            continue;
+        }
 
-            // Replace Templater title (both full name and cleaned alias)
-            noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, safeTitle);
-            noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\s*%>/gi, currentFileName);
-
-            const filePath = targetFolder ? `${targetFolder}/${currentFileName}.md` : `${currentFileName}.md`;
-
-            currentNote = {
-                fileName: currentFileName,
-                path: filePath,
-                startText: noteStartText,
-                bodyLines: []
-            };
-            notes.push(currentNote);
-
-        } else if (currentNote) {
-            currentNote.bodyLines.push(line);
+        // Content block (paragraph, list-item, code, math, table, quote)
+        if (useBlockReferences) {
+            let blockId = null;
+            if (block.type === "code" || block.type === "math") {
+                blockId = block.existingId || generateBlockId();
+                currentNote.bodyLines.push(...block.lines, `^${blockId}`);
+            } else {
+                const lastLine = block.lines[block.lines.length - 1];
+                const m = lastLine.match(/\s+\^([a-zA-Z0-9_-]+)$/);
+                blockId = m ? m[1] : generateBlockId();
+                const updatedLines = [...block.lines];
+                if (!m) {
+                    updatedLines[updatedLines.length - 1] = `${lastLine} ^${blockId}`;
+                }
+                currentNote.bodyLines.push(...updatedLines);
+            }
+            overarchingBodyLines.push(`![[${currentNote.fileName}#^${blockId}]]`);
+        } else {
+            currentNote.bodyLines.push(...block.lines);
         }
     }
 
@@ -555,7 +760,6 @@ module.exports = async function (tp, options = {}) {
         }
         let body = linesToProcess.join("\n").trim();
         let footer = "";
-        // Optional hook: transformBody(body) returns { text, footer } (footer is appended at the end of the note)
         if (typeof options.transformBody === "function") {
             const transformed = options.transformBody(body);
             body = transformed.text;
@@ -567,13 +771,16 @@ module.exports = async function (tp, options = {}) {
             fullText += body + "\n";
         }
         if (templateEnd && templateEnd.trim().length > 0) {
-            const stamp = (typeof window !== "undefined" && window.moment) ? window.moment().format("DD.MM.YYYY HH:mm") : (tp.date ? tp.date.now("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE"));
+            const stamp = (typeof window !== "undefined" && window.moment)
+                ? window.moment().format("DD.MM.YYYY HH:mm")
+                : (tp.date ? tp.date.now("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE"));
             const endText = templateEnd
                 .replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, note.fileName.split(" - ").slice(1).join(" - "))
                 .replace(/<%\s*tp\.file\.title\s*%>/gi, note.fileName)
                 .replace(/<%\s*tp\.date\.now\(\s*["']DD\.MM\.YYYY HH:mm["']\s*\)\s*%>/gi, stamp);
-            if (fullText)
-            fullText += "\n" + endText.replace(/^\n+/, "");
+            if (fullText) {
+                fullText += "\n" + endText.replace(/^\n+/, "");
+            }
         }
         if (footer) {
             fullText = fullText.replace(/\n*$/, "\n") + "\n" + footer;
@@ -592,6 +799,15 @@ module.exports = async function (tp, options = {}) {
         }
     }
 
-    new Notice(`✅ ${createdCount} atomare Notizen erfolgreich erstellt!`);
-    return "";
-}
+    if (!options.silent) {
+        new Notice(`✅ ${createdCount} atomare Notizen erfolgreich erstellt!`);
+    }
+
+    const overarchingContent = useBlockReferences ? frontmatter + overarchingBodyLines.join("\n") : "";
+
+    return {
+        createdCount,
+        overarchingContent,
+        notes
+    };
+};
