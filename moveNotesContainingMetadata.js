@@ -1,11 +1,18 @@
 /**
  * Templater User Script: moveNotesContainingMetadata
  *
- * Prompts the user to select a target note via a suggester.
- * Scans the vault for all other notes that reference the target note anywhere in their metadata/frontmatter
- * (e.g. in 'up', 'parent', 'tags', or custom frontmatter properties).
- * Automatically moves all matching notes into a separate folder named after the target note,
- * while leaving the target note itself at its current location.
+ * Prompts the user to choose between filtering by Note reference or by Tag.
+ *
+ * 1) Note filter mode:
+ *    - Prompts the user to select a target note via a suggester.
+ *    - Scans the vault (or a chosen source folder) for notes referencing the target note in their frontmatter/metadata.
+ *    - Moves matching notes into a folder named after the target note at vault root level.
+ *
+ * 2) Tag filter mode:
+ *    - Prompts the user to select a tag found in frontmatter (or enter one manually).
+ *    - Scans the vault (or a chosen source folder) for notes containing this tag in their YAML frontmatter (tags/tag).
+ *    - Includes nested sub-tags (e.g. searching for 'uni' matches 'uni' and 'uni/mathe').
+ *    - Moves matching notes into a folder named after the tag, preserving hierarchy (e.g. 'uni/mathe').
  *
  * Usage:
  * 1) Interactively in a template or hotkey:
@@ -13,7 +20,9 @@
  *
  * 2) Calling with options:
  *    <%* await tp.user.moveNotesContainingMetadata(tp, {
- *        targetNote: "MyParentNote", // optional, skips note suggester
+ *        filterType: "tag", // "note" | "tag" (optional, prompts user if omitted)
+ *        targetTag: "aufgaben", // optional for tag mode
+ *        targetNote: "MyParentNote", // optional for note mode
  *        sourceFolder: "1 - Rough Notes", // optional, restricts search to this folder (null = entire vault)
  *        targetFolder: "CustomFolder" // optional, overrides default folder at root
  *    }) -%>
@@ -95,6 +104,152 @@ function containsNoteInMetadata(file, targetFile, fileContent, fileCache) {
 }
 
 /**
+ * Normalizes a tag string by stripping leading '#' and characters like brackets/quotes.
+ *
+ * @param {string} tag - Tag string.
+ * @returns {string} Normalized tag without '#'.
+ */
+function normalizeTag(tag) {
+    if (!tag || typeof tag !== "string") return "";
+    return tag.replace(/^#+/, "").replace(/[\[\]"']/g, "").trim();
+}
+
+/**
+ * Checks whether a candidate tag matches the target tag, including sub-tags.
+ * E.g. "uni" matches "uni" and "uni/mathe", but not "unicorn".
+ *
+ * @param {string} candidateTag - Tag found in note frontmatter.
+ * @param {string} targetTag - Target tag being searched for.
+ * @returns {boolean} True if candidate matches target or is a sub-tag.
+ */
+function tagMatches(candidateTag, targetTag) {
+    const candidate = normalizeTag(candidateTag).toLowerCase();
+    const target = normalizeTag(targetTag).toLowerCase();
+    if (!candidate || !target) return false;
+    return candidate === target || candidate.startsWith(target + "/");
+}
+
+/**
+ * Extracts all tags defined in the frontmatter of a note.
+ * Checks both the Obsidian metadata cache and raw frontmatter YAML.
+ *
+ * @param {CachedMetadata|null} fileCache - Obsidian cache.
+ * @param {string} fileContent - Full text of the file.
+ * @returns {string[]} List of tag strings without '#'.
+ */
+function getFrontmatterTags(fileCache, fileContent) {
+    const tags = new Set();
+
+    function addRaw(val) {
+        if (!val) return;
+        if (typeof val === "string") {
+            val.split(/[\s,]+/).forEach(t => {
+                const norm = normalizeTag(t);
+                if (norm) tags.add(norm);
+            });
+        } else if (Array.isArray(val)) {
+            val.forEach(item => addRaw(item));
+        }
+    }
+
+    // 1. Check parsed frontmatter in cache
+    if (fileCache?.frontmatter) {
+        if (fileCache.frontmatter.tags) addRaw(fileCache.frontmatter.tags);
+        if (fileCache.frontmatter.tag) addRaw(fileCache.frontmatter.tag);
+    }
+
+    // 2. Check tags from cache that fall within frontmatter position
+    if (fileCache?.tags && fileCache?.frontmatterPosition) {
+        const fmEndOffset = fileCache.frontmatterPosition.end?.offset ?? Infinity;
+        for (const t of fileCache.tags) {
+            if (t.position && t.position.end && t.position.end.offset <= fmEndOffset) {
+                const norm = normalizeTag(t.tag);
+                if (norm) tags.add(norm);
+            }
+        }
+    }
+
+    // 3. Fallback: Parse raw YAML frontmatter if available
+    if (fileContent) {
+        const fmMatch = fileContent.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+        if (fmMatch) {
+            const fmText = fmMatch[1];
+            const tagBlockMatch = fmText.match(/^(?:tags|tag):\s*(.*(?:\r?\n(?:\s+-\s+.*|\s+.*))*)/m);
+            if (tagBlockMatch) {
+                const lines = tagBlockMatch[0].split(/\r?\n/);
+                for (const line of lines) {
+                    const listMatch = line.match(/^\s*-\s*["']?#?([^"'#\s\],]+)["']?/);
+                    if (listMatch) {
+                        const norm = normalizeTag(listMatch[1]);
+                        if (norm) tags.add(norm);
+                    } else {
+                        const inline = line.replace(/^(?:tags|tag):\s*/i, "").trim();
+                        if (inline) {
+                            const cleaned = inline.replace(/^\[|\]$/g, "");
+                            cleaned.split(/[\s,]+/).forEach(t => {
+                                const norm = normalizeTag(t);
+                                if (norm) tags.add(norm);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return Array.from(tags);
+}
+
+/**
+ * Checks whether a note contains the target tag in its frontmatter.
+ *
+ * @param {TFile} file - Note file to check.
+ * @param {string} targetTag - Target tag being searched for.
+ * @param {string} fileContent - Full text of the file.
+ * @param {CachedMetadata|null} fileCache - Obsidian cache.
+ * @returns {boolean} True if matching tag found in frontmatter.
+ */
+function containsTagInFrontmatter(file, targetTag, fileContent, fileCache) {
+    const fmTags = getFrontmatterTags(fileCache, fileContent);
+    return fmTags.some(tag => tagMatches(tag, targetTag));
+}
+
+/**
+ * Collects all frontmatter tags across all markdown files in the vault and counts their occurrences.
+ *
+ * @param {App} app - Obsidian App instance.
+ * @returns {Record<string, number>} Object mapping tag name to occurrence count.
+ */
+function collectVaultFrontmatterTags(app) {
+    const tagCounts = {};
+    const allFiles = app.vault.getMarkdownFiles();
+
+    for (const file of allFiles) {
+        const cache = app.metadataCache.getFileCache(file);
+        if (cache?.frontmatter) {
+            const rawTags = cache.frontmatter.tags ?? cache.frontmatter.tag;
+            if (rawTags) {
+                const add = (t) => {
+                    if (typeof t === "string") {
+                        t.split(/[\s,]+/).forEach(single => {
+                            const norm = normalizeTag(single);
+                            if (norm) {
+                                tagCounts[norm] = (tagCounts[norm] || 0) + 1;
+                            }
+                        });
+                    } else if (Array.isArray(t)) {
+                        t.forEach(add);
+                    }
+                };
+                add(rawTags);
+            }
+        }
+    }
+
+    return tagCounts;
+}
+
+/**
  * Ensures that a directory path exists in the vault, creating intermediate folders if necessary.
  *
  * @param {App} app - Obsidian App instance.
@@ -134,63 +289,163 @@ function showNotice(msg) {
 module.exports = async function (tp, options = {}) {
     const app = tp.app || window.app;
 
-    // 1. Resolve the target note
-    let targetFile = null;
-    if (options.targetFile) {
-        targetFile = typeof options.targetFile === "string"
-            ? app.vault.getAbstractFileByPath(options.targetFile)
-            : options.targetFile;
-    } else if (options.targetNote) {
-        if (typeof options.targetNote === "string") {
-            const all = app.vault.getMarkdownFiles();
-            targetFile = all.find(f => f.basename === options.targetNote || f.path === options.targetNote);
-        } else {
-            targetFile = options.targetNote;
+    // 1. Determine filter mode: "note" or "tag"
+    let filterType = options.filterType;
+    if (!filterType) {
+        if (options.targetNote || options.targetFile) {
+            filterType = "note";
+        } else if (options.targetTag) {
+            filterType = "tag";
         }
     }
 
-    // 2. If not specified, prompt the user with a suggester
-    if (!targetFile && tp.system) {
-        const activeFile = app.workspace.getActiveFile();
-        const allFiles = app.vault.getMarkdownFiles();
+    if (!filterType && tp.system) {
+        const filterChoices = [
+            "📝 Notiz (Notizen, die eine bestimmte Notiz referenzieren)",
+            "🏷️ Tag (Notizen mit einem bestimmten Tag im Frontmatter)"
+        ];
+        const filterValues = ["note", "tag"];
 
-        if (allFiles.length === 0) {
-            showNotice("⚠️ Keine Markdown-Dateien im Vault gefunden!");
-            return;
-        }
-
-        // Sort files alphabetically, placing currently active file at the top
-        const sortedFiles = allFiles.slice().sort((a, b) => {
-            if (activeFile && a.path === activeFile.path) return -1;
-            if (activeFile && b.path === activeFile.path) return 1;
-            return a.basename.localeCompare(b.basename, "de", { sensitivity: "base" });
-        });
-
-        const displayNames = sortedFiles.map(f => {
-            if (activeFile && f.path === activeFile.path) {
-                return `📌 ${f.basename} (Aktuelle Notiz)`;
-            }
-            return f.basename;
-        });
-
-        targetFile = await tp.system.suggester(
-            displayNames,
-            sortedFiles,
+        const chosenFilter = await tp.system.suggester(
+            filterChoices,
+            filterValues,
             false,
-            "Wähle die Notiz aus, deren referenzierende Notizen verschoben werden sollen:"
+            "Wonach möchtest du filtern?"
         );
+
+        if (!chosenFilter) {
+            showNotice("Abgebrochen: Kein Filter-Typ ausgewählt.");
+            return "";
+        }
+        filterType = chosenFilter;
     }
 
-    if (!targetFile) {
-        showNotice("Abgebrochen: Keine Notiz ausgewählt.");
-        return;
+    if (!filterType) {
+        filterType = "note"; // Fallback default
     }
 
-    // 2b. Determine the source folder to search in
+    let targetFile = null;
+    let targetTag = "";
+    let cleanFolderName = "";
+    let targetFolderPath = "";
+
+    // 2. Resolve target based on selected filter type
+    if (filterType === "note") {
+        // --- NOTE FILTER MODE ---
+        if (options.targetFile) {
+            targetFile = typeof options.targetFile === "string"
+                ? app.vault.getAbstractFileByPath(options.targetFile)
+                : options.targetFile;
+        } else if (options.targetNote) {
+            if (typeof options.targetNote === "string") {
+                const all = app.vault.getMarkdownFiles();
+                targetFile = all.find(f => f.basename === options.targetNote || f.path === options.targetNote);
+            } else {
+                targetFile = options.targetNote;
+            }
+        }
+
+        if (!targetFile && tp.system) {
+            const activeFile = app.workspace.getActiveFile();
+            const allFiles = app.vault.getMarkdownFiles();
+
+            if (allFiles.length === 0) {
+                showNotice("⚠️ Keine Markdown-Dateien im Vault gefunden!");
+                return "";
+            }
+
+            const sortedFiles = allFiles.slice().sort((a, b) => {
+                if (activeFile && a.path === activeFile.path) return -1;
+                if (activeFile && b.path === activeFile.path) return 1;
+                return a.basename.localeCompare(b.basename, "de", { sensitivity: "base" });
+            });
+
+            const displayNames = sortedFiles.map(f => {
+                if (activeFile && f.path === activeFile.path) {
+                    return `📌 ${f.basename} (Aktuelle Notiz)`;
+                }
+                return f.basename;
+            });
+
+            targetFile = await tp.system.suggester(
+                displayNames,
+                sortedFiles,
+                false,
+                "Wähle die Notiz aus, deren referenzierende Notizen verschoben werden sollen:"
+            );
+        }
+
+        if (!targetFile) {
+            showNotice("Abgebrochen: Keine Notiz ausgewählt.");
+            return "";
+        }
+
+        cleanFolderName = targetFile.basename.replace(/[\\/:|#^\[\]*?"<>]/g, "").trim();
+        targetFolderPath = options.targetFolder
+            ? options.targetFolder.replace(/^\/+|\/+$/g, "")
+            : cleanFolderName;
+
+    } else {
+        // --- TAG FILTER MODE ---
+        if (options.targetTag) {
+            targetTag = normalizeTag(options.targetTag);
+        }
+
+        if (!targetTag && tp.system) {
+            const tagCounts = collectVaultFrontmatterTags(app);
+            const distinctTags = Object.keys(tagCounts).sort((a, b) =>
+                a.localeCompare(b, "de", { sensitivity: "base" })
+            );
+
+            const displayLabels = [
+                "✏️ Anderen Tag manuell eingeben...",
+                ...distinctTags.map(t => `#${t} (${tagCounts[t]} Notiz${tagCounts[t] === 1 ? "" : "en"})`)
+            ];
+            const displayValues = [
+                "__CUSTOM__",
+                ...distinctTags
+            ];
+
+            const chosen = await tp.system.suggester(
+                displayLabels,
+                displayValues,
+                false,
+                "Wähle einen Tag aus (aus Frontmatter-Metadaten):"
+            );
+
+            if (chosen === undefined || chosen === null) {
+                showNotice("Abgebrochen: Kein Tag ausgewählt.");
+                return "";
+            }
+
+            if (chosen === "__CUSTOM__") {
+                const entered = await tp.system.prompt("Welchen Tag möchtest du filtern? (ohne '#'):");
+                if (!entered || !entered.trim()) {
+                    showNotice("Abgebrochen: Kein Tag eingegeben.");
+                    return "";
+                }
+                targetTag = normalizeTag(entered);
+            } else {
+                targetTag = normalizeTag(chosen);
+            }
+        }
+
+        if (!targetTag) {
+            showNotice("Abgebrochen: Kein Tag angegeben.");
+            return "";
+        }
+
+        // Target folder for tags: preserve subfolder hierarchies (e.g. uni/mathe)
+        cleanFolderName = targetTag.replace(/[\\:|#^\[\]*?"<>]/g, "").trim().replace(/^\/+|\/+$/g, "");
+        targetFolderPath = options.targetFolder
+            ? options.targetFolder.replace(/^\/+|\/+$/g, "")
+            : cleanFolderName;
+    }
+
+    // 3. Determine the source folder to search in
     let sourceFolder = options.sourceFolder !== undefined ? options.sourceFolder : undefined;
 
     if (sourceFolder === undefined && tp.system && options.askSourceFolder !== false) {
-        // Collect all distinct folder paths present in the vault
         const folderSet = new Set();
         if (typeof app.vault.getAllLoadedFiles === "function") {
             for (const item of app.vault.getAllLoadedFiles()) {
@@ -218,28 +473,26 @@ module.exports = async function (tp, options = {}) {
             ...sortedFolders
         ];
 
+        const promptTitle = filterType === "note"
+            ? "Aus welchem Ordner soll nach referenzierenden Notizen gesucht werden?"
+            : `Aus welchem Ordner soll nach Notizen mit Tag #${targetTag} gesucht werden?`;
+
         const chosenFolder = await tp.system.suggester(
             folderLabels,
             folderValues,
             false,
-            "Aus welchem Ordner soll nach referenzierenden Notizen gesucht werden?"
+            promptTitle
         );
 
         if (chosenFolder === undefined) {
             showNotice("Abgebrochen: Kein Suchordner ausgewählt.");
-            return;
+            return "";
         }
 
         sourceFolder = chosenFolder;
     }
 
-    // 3. Determine the target folder (named after the target note at vault root level)
-    const cleanFolderName = targetFile.basename.replace(/[\\/:|#^\[\]*?"<>]/g, "").trim();
-    const targetFolderPath = options.targetFolder
-        ? options.targetFolder.replace(/^\/+|\/+$/g, "")
-        : cleanFolderName;
-
-    // 4. Scan markdown files for metadata referencing the target note
+    // 4. Scan markdown files for matching criteria
     let allFiles = app.vault.getMarkdownFiles();
 
     // Filter by source folder if one was selected
@@ -254,7 +507,9 @@ module.exports = async function (tp, options = {}) {
     const matchingFiles = [];
 
     for (const file of allFiles) {
-        if (file.path === targetFile.path) continue;
+        if (filterType === "note" && targetFile && file.path === targetFile.path) {
+            continue; // Never move the referenced target note itself
+        }
 
         const cache = app.metadataCache.getFileCache(file);
         let content = "";
@@ -264,30 +519,36 @@ module.exports = async function (tp, options = {}) {
             console.error(`Fehler beim Lesen der Datei '${file.path}':`, err);
         }
 
-        if (containsNoteInMetadata(file, targetFile, content, cache)) {
+        const isMatch = filterType === "note"
+            ? containsNoteInMetadata(file, targetFile, content, cache)
+            : containsTagInFrontmatter(file, targetTag, content, cache);
+
+        if (isMatch) {
             matchingFiles.push(file);
         }
     }
 
+    // 5. Handle case where no notes match
     if (matchingFiles.length === 0) {
-        if (sourceFolder) {
-            showNotice(`ℹ️ Keine Notizen im Ordner "${sourceFolder}" gefunden, die "${targetFile.basename}" in ihren Metadaten enthalten.`);
+        const sourceInfo = sourceFolder ? ` im Ordner "${sourceFolder}"` : "";
+        if (filterType === "note") {
+            showNotice(`ℹ️ Keine Notizen${sourceInfo} gefunden, die "${targetFile.basename}" in ihren Metadaten enthalten.`);
         } else {
-            showNotice(`ℹ️ Keine Notizen gefunden, die "${targetFile.basename}" in ihren Metadaten enthalten.`);
+            showNotice(`ℹ️ Keine Notizen${sourceInfo} gefunden, die den Tag "#${targetTag}" im Frontmatter enthalten.`);
         }
-        return;
+        return "";
     }
 
-    // 5. Ensure the destination folder exists
+    // 6. Ensure destination folder exists
     try {
         await ensureFolderExists(app, targetFolderPath);
     } catch (err) {
         console.error(`Fehler beim Erstellen des Ordners '${targetFolderPath}':`, err);
-        showNotice(`❌ Fehler beim Erstellen des Ordners "${cleanFolderName}": ${err.message}`);
-        return;
+        showNotice(`❌ Fehler beim Erstellen des Ordners "${targetFolderPath}": ${err.message}`);
+        return "";
     }
 
-    // 6. Move matching files to the target folder
+    // 7. Move matching files to target folder
     let movedCount = 0;
     let alreadyInFolderCount = 0;
     let errorCount = 0;
@@ -318,10 +579,16 @@ module.exports = async function (tp, options = {}) {
         }
     }
 
-    // 7. User feedback
+    // 8. User feedback
+    const sourceInfo = sourceFolder ? ` aus "${sourceFolder}"` : "";
     if (movedCount > 0) {
-        const sourceInfo = sourceFolder ? ` aus "${sourceFolder}"` : "";
-        let msg = `✅ ${movedCount} Notiz(en)${sourceInfo} erfolgreich in den Ordner "${cleanFolderName}" verschoben!`;
+        let msg = "";
+        if (filterType === "note") {
+            msg = `✅ ${movedCount} Notiz(en)${sourceInfo} erfolgreich in den Ordner "${targetFolderPath}" verschoben!`;
+        } else {
+            msg = `✅ ${movedCount} Notiz(en)${sourceInfo} mit Tag "#${targetTag}" erfolgreich in den Ordner "${targetFolderPath}" verschoben!`;
+        }
+
         if (alreadyInFolderCount > 0) {
             msg += `\n(${alreadyInFolderCount} Notiz(en) befanden sich bereits im Ordner)`;
         }
@@ -330,9 +597,13 @@ module.exports = async function (tp, options = {}) {
         }
         showNotice(msg);
     } else if (alreadyInFolderCount > 0) {
-        showNotice(`ℹ️ Alle ${alreadyInFolderCount} referenzierenden Notizen befinden sich bereits im Ordner "${cleanFolderName}".`);
+        if (filterType === "note") {
+            showNotice(`ℹ️ Alle ${alreadyInFolderCount} referenzierenden Notizen befinden sich bereits im Ordner "${targetFolderPath}".`);
+        } else {
+            showNotice(`ℹ️ Alle ${alreadyInFolderCount} Notizen mit Tag "#${targetTag}" befinden sich bereits im Ordner "${targetFolderPath}".`);
+        }
     } else if (errorCount > 0) {
-        showNotice(`❌ Fehler beim Verschieben der Notizen.`);
+        showNotice("❌ Fehler beim Verschieben der Notizen.");
     }
 
     return "";

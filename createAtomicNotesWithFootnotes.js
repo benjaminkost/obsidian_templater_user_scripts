@@ -63,14 +63,26 @@ function convertPdfLinksToFootnotes(body) {
     };
 }
 
-module.exports = async function (tp, options = {}) {
-    if (typeof tp.user?.createAtomicNotes !== "function") {
-        new Notice("❌ tp.user.createAtomicNotes wurde nicht gefunden (createAtomicNotes.js im User-Scripts-Ordner?).");
-        return;
+function createAtomicNotesWithFootnotes(tp, options = {}) {
+    const promise = (async () => {
+        if (typeof tp.user?.createAtomicNotes !== "function") {
+            new Notice("❌ tp.user.createAtomicNotes wurde nicht gefunden (createAtomicNotes.js im User-Scripts-Ordner?).");
+            return "";
+        }
+
+        return await tp.user.createAtomicNotes(tp, {
+            ...options,
+            transformBody: convertPdfLinksToFootnotes
+        });
+    })();
+
+    promise.toString = () => "";
+    promise.valueOf = () => "";
+    if (typeof Symbol !== "undefined" && Symbol.toPrimitive) {
+        promise[Symbol.toPrimitive] = () => "";
     }
 
-    return await tp.user.createAtomicNotes(tp, {
-        ...options,
-        transformBody: convertPdfLinksToFootnotes
-    });
-};
+    return promise;
+}
+
+module.exports = createAtomicNotesWithFootnotes;
