@@ -5,6 +5,9 @@
  * Splits a long document into atomic notes based on its headings (#, ##, ###, ...).
  * Automatically writes the parent heading into the 'up' metadata property.
  * 
+ * Supports using a separate template for notes matching specific words
+ * (e.g. "Aufgabe", "Übung", "Definition") both interactively and via options.
+ * 
  * Usage:
  * 1) Interactively in a template:
  *    <%* await tp.user.createAtomicNotes(tp) -%>
@@ -13,6 +16,8 @@
  *    <%* await tp.user.createAtomicNotes(tp, {
  *        sourceFile: "Path/to/big_note.md",
  *        templateFile: "5 - Templates and Scripts/Template Notes/MyTemplate.md",
+ *        specialWords: ["Aufgabe", "Übung"],
+ *        specialTemplateFile: "5 - Templates and Scripts/Template Notes/ExerciseTemplate.md",
  *        existingTags: ["202610091200 - Parent Topic"],
  *        targetFolder: "" // Vault root or e.g. "1 - Rough Notes"
  *    }) -%>
@@ -806,7 +811,7 @@ async function resolveTemplate(app, tp, options) {
     if (typeof options.templateStart === "string") {
         templateStart = options.templateStart;
         templateEnd = typeof options.templateEnd === "string" ? options.templateEnd : "";
-        return { templateStart, templateEnd };
+        return { templateStart, templateEnd, templateName: "Custom String" };
     }
 
     // B) Explicit file paths
@@ -819,7 +824,7 @@ async function resolveTemplate(app, tp, options) {
         if (file) templateEnd = await app.vault.read(file);
     }
     if (templateStart) {
-        return { templateStart, templateEnd };
+        return { templateStart, templateEnd, templateName: "File Split" };
     }
 
     // C) Single template file (TFile or path)
@@ -829,7 +834,7 @@ async function resolveTemplate(app, tp, options) {
     }
 
     // D) Interactive selection via suggester if not specified
-    if (!templateFile && tp && tp.system && !options.skipPrompt) {
+    if (!templateFile && tp && tp.system && !options.skipPrompt && !options.skipTemplatePrompt) {
         const templateFolder = (options.templateFolder || "5 - Templates and Scripts/Template Notes").replace(/\/+$/, "");
         let templateFiles = app.vault.getMarkdownFiles()
             .filter(f => f.path.startsWith(templateFolder + "/"));
@@ -845,7 +850,8 @@ async function resolveTemplate(app, tp, options) {
             );
             const choices = ["❌ Vorgang abbrechen", "(Kein Template / Standard)", ...displayNames];
             const values = ["CANCEL", "DEFAULT", ...templateFiles];
-            const chosen = await tp.system.suggester(choices, values, false, "Welches Template möchtest du nutzen?");
+            const promptTitle = options.promptTitle || "Welches Template möchtest du nutzen?";
+            const chosen = await tp.system.suggester(choices, values, false, promptTitle);
             if (chosen === "CANCEL" || chosen === undefined) {
                 return { cancelled: true };
             }
@@ -887,13 +893,52 @@ async function resolveTemplate(app, tp, options) {
             templateStart = split.templateStart;
             templateEnd = split.templateEnd;
         }
-        return { templateStart, templateEnd };
+        return {
+            templateStart,
+            templateEnd,
+            templateName: templateFile.basename || templateFile.name || "Template"
+        };
     }
 
     // Fallback: default header
     templateStart = `---\n"created date:": \naliases:\nmytags:\n---\n`;
     templateEnd = "";
-    return { templateStart, templateEnd };
+    return { templateStart, templateEnd, templateName: "Standard" };
+}
+
+function parseWordList(input) {
+    if (!input) return [];
+    if (Array.isArray(input)) {
+        return input.map(w => String(w).trim()).filter(Boolean);
+    }
+    return String(input)
+        .split(/[,;\n]+/)
+        .map(w => w.trim())
+        .filter(Boolean);
+}
+
+function getTemplateForTitle(title, cleanTitle, defaultTmpl, specialTemplates = []) {
+    if (!specialTemplates || specialTemplates.length === 0) {
+        return defaultTmpl;
+    }
+    const tLower = (title || "").toLowerCase();
+    const cLower = (cleanTitle || "").toLowerCase();
+
+    for (const st of specialTemplates) {
+        if (!st.words || st.words.length === 0) continue;
+        const matches = st.words.some(word => {
+            const w = word.trim().toLowerCase();
+            return w.length > 0 && (tLower.includes(w) || cLower.includes(w));
+        });
+        if (matches) {
+            return {
+                templateStart: st.templateStart,
+                templateEnd: st.templateEnd,
+                templateName: st.templateName || "Separates Template"
+            };
+        }
+    }
+    return defaultTmpl;
 }
 /**
  * Normalizes headings in a note body so that the highest sub-heading
@@ -950,6 +995,527 @@ function generateBlockId() {
     return Math.random().toString(36).slice(2, 8).padEnd(6, "0");
 }
 
+function escapeRegex(str) {
+    return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Checks whether the string is wrapped in matching array brackets `[ ... ]`.
+ * Returns false for single wikilinks `[[...]]` or comma-separated wikilinks `[[A]], [[B]]`.
+ *
+ * @param {string} str - String to test.
+ * @returns {boolean} True if wrapped in outer matching array brackets.
+ */
+function hasOuterArrayBrackets(str) {
+    if (!str || typeof str !== "string") return false;
+    const trimmed = str.trim();
+    if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return false;
+
+    // Single wikilink [[...]] is NOT an array
+    if (/^\[\[[^\[\]\r\n]+\]\]$/.test(trimmed)) return false;
+
+    // Single-bracket link like [Note|Alias] or [202607031507 - Note] is NOT an array
+    if (/^\[[^\[\]\r\n]+\|[^\[\]\r\n]+\]$/.test(trimmed)) return false;
+    if (/^\[\s*\d{8,}\s*-\s*[^\[\]\r\n]+\]$/.test(trimmed)) return false;
+
+    let depth = 0;
+    for (let i = 0; i < trimmed.length; i++) {
+        if (trimmed[i] === "[") {
+            depth++;
+        } else if (trimmed[i] === "]") {
+            depth--;
+            if (depth === 0) {
+                return i === trimmed.length - 1;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Extracts individual list items from an input string or array.
+ * Separates multiple wikilinks (e.g. `[[A]], [[B]]`), inline array elements,
+ * or comma-separated values into distinct individual items.
+ *
+ * @param {string|string[]} input - Raw item, line, or array of items.
+ * @returns {string[]} Array of individual list items.
+ */
+function extractListItems(input) {
+    if (!input) return [];
+    const rawList = Array.isArray(input) ? input : [input];
+    const result = [];
+
+    for (let raw of rawList) {
+        if (!raw || typeof raw !== "string") continue;
+        let str = raw.trim();
+        if (!str) continue;
+
+        // Strip outer quotes if inner content has multiple items or is a quoted wikilink
+        if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
+            const inner = str.slice(1, -1).trim();
+            if (/^\[\[.*\]\]$/.test(inner) || inner.includes(",") || (/\[\[/g.test(inner) && (inner.match(/\[\[/g) || []).length > 1)) {
+                str = inner;
+            }
+        }
+
+        // Strip outer array brackets [ ... ] if present
+        while (hasOuterArrayBrackets(str)) {
+            str = str.slice(1, -1).trim();
+        }
+
+        // Find all wikilinks [[...]]
+        const wikilinkMatches = Array.from(str.matchAll(/\[\[([^\]\r\n]+)\]\]/g));
+        if (wikilinkMatches.length > 1) {
+            // Multiple wikilinks found! Each wikilink is its own list item
+            for (const m of wikilinkMatches) {
+                result.push(m[0]);
+            }
+        } else if (wikilinkMatches.length === 1 && !str.includes(",")) {
+            // Single wikilink alone
+            result.push(wikilinkMatches[0][0]);
+        } else if (str.includes(",")) {
+            // Comma-separated list (tags or plain items)
+            const split = splitInlineList(str);
+            for (const s of split) {
+                if (s.trim().length > 0) {
+                    result.push(s.trim());
+                }
+            }
+        } else {
+            result.push(str);
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Splits an inline YAML list string (e.g. `[item1, "item, 2", [[Note A, Part 1]]]`)
+ * respecting quotes and wikilink brackets.
+ *
+ * @param {string} innerStr - Content inside brackets `[...]`.
+ * @returns {string[]} Parsed items.
+ */
+function splitInlineList(innerStr) {
+    if (!innerStr || typeof innerStr !== "string") return [];
+    const items = [];
+    let current = "";
+    let inQuotes = false;
+    let quoteChar = "";
+    let bracketDepth = 0;
+
+    for (let i = 0; i < innerStr.length; i++) {
+        const char = innerStr[i];
+        if (!inQuotes && (char === '"' || char === "'")) {
+            inQuotes = true;
+            quoteChar = char;
+            current += char;
+        } else if (inQuotes && char === quoteChar) {
+            inQuotes = false;
+            quoteChar = "";
+            current += char;
+        } else if (!inQuotes && char === "[" && innerStr[i + 1] === "[") {
+            bracketDepth++;
+            current += "[[";
+            i++;
+        } else if (!inQuotes && char === "]" && innerStr[i + 1] === "]") {
+            bracketDepth = Math.max(0, bracketDepth - 1);
+            current += "]]";
+            i++;
+        } else if (!inQuotes && bracketDepth === 0 && char === ",") {
+            if (current.trim().length > 0) {
+                items.push(current.trim());
+            }
+            current = "";
+        } else {
+            current += char;
+        }
+    }
+    if (current.trim().length > 0) {
+        items.push(current.trim());
+    }
+    return items;
+}
+
+/**
+ * Formats a list item for YAML frontmatter.
+ * Ensures wikilinks are properly formatted as "[[...]]" (fixing single brackets if present),
+ * preserves existing quotes, and quotes strings with YAML special characters.
+ *
+ * @param {string} item - The item to format.
+ * @returns {string} Formatted YAML list item line (e.g. `  - "[[Note]]"`).
+ */
+function formatListItem(item) {
+    if (item === null || item === undefined) return "";
+    let trimmed = String(item).trim();
+    if (!trimmed) return "";
+
+    // Strip outer quotes to inspect true content
+    const unquoted = trimmed.replace(/^["'`]|["'`]$/g, "").trim();
+
+    // 1. Single-bracketed link like [Note] or [Note|Alias] -> convert to [[Note]] / [[Note|Alias]]
+    if (unquoted.startsWith("[") && !unquoted.startsWith("[[") && unquoted.endsWith("]") && !unquoted.endsWith("]]")) {
+        const inner = unquoted.slice(1, -1).trim();
+        if (inner.length > 0) {
+            return `  - "[[${inner}]]"`;
+        }
+    }
+
+    // 2. Wikilink [[...]] (whether originally quoted or not) -> ensure quoted for YAML safety: "[[...]]"
+    if (/^\[\[.*\]\]$/.test(unquoted)) {
+        return `  - "${unquoted}"`;
+    }
+
+    // 3. Already quoted string (non-wikilink)
+    if (/^["'].*["']$/.test(trimmed)) {
+        return `  - ${trimmed}`;
+    }
+
+    // 4. Contains YAML special characters -> quote it
+    if (/[:\[\]{}#"',]/.test(unquoted)) {
+        return `  - "${unquoted.replace(/"/g, '\\"')}"`;
+    }
+
+    return `  - ${unquoted}`;
+}
+
+/**
+ * Checks whether an item already exists in a frontmatter list text block.
+ *
+ * @param {string} item - Item to look for (e.g. `[[Target]]` or `"tag"`).
+ * @param {string} existingBlock - Text block containing the existing property/list.
+ * @returns {boolean} True if already present.
+ */
+function isItemAlreadyInList(item, existingBlock) {
+    if (!item || !existingBlock) return false;
+    let trimmed = String(item).trim().replace(/^["'`]|["'`]$/g, "").trim();
+
+    // Check wikilinks by target note name (matches both [[Target]] and [Target])
+    const wikilinkMatch = trimmed.match(/^\[{1,2}([^\]|#]+)/);
+    if (wikilinkMatch) {
+        const target = wikilinkMatch[1].trim();
+        const escaped = escapeRegex(target);
+        const regex = new RegExp(`\\[{1,2}${escaped}(?:[\\|#][^\\]]*)?\\]{1,2}`, "i");
+        return regex.test(existingBlock);
+    }
+
+    // Plain scalar / tag
+    const clean = trimmed;
+    const escaped = escapeRegex(clean);
+    const regex = new RegExp(`(^|[\\s,\\["'])${escaped}(["'\\]\\s]|$)`, "i");
+    return regex.test(existingBlock);
+}
+
+/**
+ * Parses raw YAML lines from a section-level metadata block into structured property objects.
+ * Supports multiline lists, unindented lists, inline lists, and scalar properties.
+ *
+ * @param {string} rawYaml - Raw YAML text between delimiters.
+ * @returns {Array<{key: string, type: 'list' | 'scalar' | 'empty', items: string[], value: string, rawLines: string[]}>}
+ */
+function parseMetadataYaml(rawYaml) {
+    if (!rawYaml || typeof rawYaml !== "string") return [];
+    const lines = rawYaml.split(/\r?\n/);
+    const properties = [];
+    let currentProp = null;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        // Skip blank lines and YAML comments
+        if (trimmed.length === 0 || /^#/.test(trimmed)) {
+            continue;
+        }
+
+        // 1. List item (- item, * item, + item)
+        const listMatch = line.match(/^(\s*)([-*+])\s+(.*)$/);
+        if (listMatch) {
+            const itemText = listMatch[3].trim();
+            if (currentProp) {
+                currentProp.type = "list";
+                const extracted = extractListItems(itemText);
+                if (extracted.length > 0) {
+                    currentProp.items.push(...extracted);
+                }
+                currentProp.rawLines.push(line);
+            }
+            continue;
+        }
+
+        // 2. Key definition (key: or "key": or key: value)
+        const keyMatch = line.match(/^(\s*)["']?([^:\r\n]+?)["']?\s*:(.*)$/);
+        if (keyMatch) {
+            if (currentProp) {
+                properties.push(currentProp);
+            }
+            const key = keyMatch[2].trim();
+            const rest = keyMatch[3].trim();
+
+            currentProp = {
+                key,
+                type: "scalar",
+                items: [],
+                value: "",
+                rawLines: [line]
+            };
+
+            if (rest.length === 0) {
+                currentProp.type = "empty";
+            } else {
+                const extracted = extractListItems(rest);
+                if (extracted.length > 1) {
+                    currentProp.type = "list";
+                    currentProp.items = extracted;
+                } else if (extracted.length === 1 && /^["']?\[\[.*\]\]["']?$/.test(rest.trim())) {
+                    currentProp.type = "list";
+                    currentProp.items = extracted;
+                    currentProp.value = extracted[0];
+                } else if (hasOuterArrayBrackets(rest)) {
+                    currentProp.type = "list";
+                    currentProp.items = extracted;
+                } else {
+                    currentProp.type = "scalar";
+                    currentProp.value = rest;
+                }
+            }
+            continue;
+        }
+
+        // 3. Indented continuation line
+        if (/^\s+\S/.test(line) && currentProp) {
+            currentProp.rawLines.push(line);
+            if (currentProp.type === "scalar" && currentProp.value) {
+                currentProp.value += " " + trimmed;
+            }
+        }
+    }
+
+    if (currentProp) {
+        properties.push(currentProp);
+    }
+
+    return properties;
+}
+
+/**
+ * Checks if the line at startIdx begins a section metadata block enclosed by --- and ---.
+ * Validates that every non-empty line inside contains valid YAML syntax (keys, list items, comments, or indentation),
+ * and requires at least one property key definition.
+ *
+ * @param {string[]} lines - All lines of the document.
+ * @param {number} startIdx - Index of the opening line.
+ * @returns {object|null} Block object if matched, or null if regular divider / not metadata.
+ */
+function tryParseMetadataBlock(lines, startIdx) {
+    const line = lines[startIdx];
+    if (!/^\s*---+\s*$/.test(line)) return null;
+
+    let endIdx = -1;
+    for (let k = startIdx + 1; k < lines.length; k++) {
+        const cur = lines[k];
+        // Stop if a heading is reached before closing delimiter
+        if (/^\s*#{1,6}\s+/.test(cur)) {
+            return null;
+        }
+        if (/^\s*---+\s*$/.test(cur)) {
+            endIdx = k;
+            break;
+        }
+    }
+
+    if (endIdx === -1) return null;
+
+    const innerLines = lines.slice(startIdx + 1, endIdx);
+    const nonEmptyLines = innerLines.filter(l => l.trim().length > 0);
+    if (nonEmptyLines.length === 0) return null;
+
+    let hasKeyDefinition = false;
+    for (const l of nonEmptyLines) {
+        const trimmed = l.trim();
+        if (/^[-*+]\s+/.test(trimmed)) {
+            // list item
+        } else if (/^["']?([^:\r\n]+?)["']?\s*:(.*)/.test(trimmed)) {
+            hasKeyDefinition = true;
+        } else if (/^#/.test(trimmed)) {
+            // comment
+        } else if (/^\s+\S/.test(l)) {
+            // indented continuation line
+        } else {
+            // Prose / regular text -> not a YAML metadata block
+            return null;
+        }
+    }
+
+    if (!hasKeyDefinition) return null;
+
+    const rawYaml = innerLines.join("\n");
+    const metadata = parseMetadataYaml(rawYaml);
+
+    return {
+        type: "metadata",
+        lines: lines.slice(startIdx, endIdx + 1),
+        rawYaml,
+        metadata,
+        nextIdx: endIdx + 1
+    };
+}
+
+/**
+ * Merges section-level metadata properties into a note's frontmatter (or note header).
+ * Preserves existing frontmatter, merges list properties (like requires, required_by, down, up, tags)
+ * without duplicates, fills empty keys, and adds new properties before the closing ---.
+ *
+ * @param {string} content - Current note startText or full note text.
+ * @param {Array|string} propertiesOrYaml - Array of parsed properties or raw YAML string.
+ * @returns {string} Updated content with metadata merged into frontmatter.
+ */
+function mergeMetadataIntoFrontmatter(content, propertiesOrYaml) {
+    if (!content) content = "";
+    const properties = Array.isArray(propertiesOrYaml)
+        ? propertiesOrYaml
+        : parseMetadataYaml(propertiesOrYaml);
+
+    if (!properties || properties.length === 0) {
+        return content;
+    }
+
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    let frontmatter = "";
+    let restOfContent = "";
+
+    if (fmMatch) {
+        frontmatter = fmMatch[1];
+        restOfContent = content.slice(fmMatch[0].length);
+    } else {
+        restOfContent = content;
+    }
+
+    for (const prop of properties) {
+        const key = prop.key;
+        if (!key) continue;
+
+        const isListProp = prop.type === "list" || (prop.items && prop.items.length > 0);
+        if (isListProp && prop.items && prop.items.length > 0) {
+            prop.items = extractListItems(prop.items);
+        }
+        const escapedKey = escapeRegex(key);
+
+        const keyLineRegex = new RegExp(`^([ \\t]*["']?${escapedKey}["']?[ \\t]*:)(.*)$`, "m");
+        const keyMatch = frontmatter.match(keyLineRegex);
+
+        if (!keyMatch) {
+            // Key does not exist in frontmatter -> append before closing ---
+            let propBlock = "";
+            if (isListProp) {
+                const formattedItems = prop.items
+                    .map(it => formatListItem(it))
+                    .filter(Boolean)
+                    .join("\n");
+                propBlock = formattedItems.length > 0 ? `${key}:\n${formattedItems}` : `${key}:`;
+            } else if (prop.type === "empty") {
+                propBlock = `${key}:`;
+            } else {
+                propBlock = `${key}: ${prop.value}`;
+            }
+
+            if (frontmatter.trim().length === 0) {
+                frontmatter = propBlock;
+            } else {
+                frontmatter = frontmatter.replace(/\r?\n?$/, `\n${propBlock}`);
+            }
+            continue;
+        }
+
+        // Key exists in frontmatter
+        const restOfKeyLine = keyMatch[2].trim();
+        const multilineListRegex = new RegExp(
+            `^([ \\t]*["']?${escapedKey}["']?[ \\t]*:[ \\t]*\\r?\\n)((?:[ \\t]+-.*(?:\\r?\\n|$))+)`,
+            "m"
+        );
+        const multilineMatch = frontmatter.match(multilineListRegex);
+
+        if (multilineMatch) {
+            // Multiline list exists: key:\n  - item1...
+            if (isListProp) {
+                const existingListText = multilineMatch[2];
+                const itemsToAdd = [];
+                for (const it of prop.items) {
+                    if (!isItemAlreadyInList(it, existingListText)) {
+                        itemsToAdd.push(formatListItem(it));
+                    }
+                }
+                if (itemsToAdd.length > 0) {
+                    const addition = itemsToAdd.join("\n") + "\n";
+                    frontmatter = frontmatter.replace(multilineListRegex, (m, header, listBody) => {
+                        return `${header}${listBody.replace(/\r?\n?$/, "\n")}${addition}`;
+                    });
+                }
+            }
+        } else if (hasOuterArrayBrackets(restOfKeyLine) || (restOfKeyLine.startsWith("[") && restOfKeyLine.endsWith("]"))) {
+            // Inline list: key: [...]
+            if (isListProp) {
+                const existingItems = extractListItems(restOfKeyLine);
+                const itemsToAdd = [];
+                for (const it of prop.items) {
+                    if (!isItemAlreadyInList(it, restOfKeyLine)) {
+                        itemsToAdd.push(it);
+                    }
+                }
+                if (itemsToAdd.length > 0 || existingItems.length > 0) {
+                    const allItems = [...existingItems, ...itemsToAdd]
+                        .map(it => formatListItem(it))
+                        .join("\n");
+                    frontmatter = frontmatter.replace(keyLineRegex, `${key}:\n${allItems}`);
+                }
+            }
+        } else if (restOfKeyLine.length === 0) {
+            // Empty key: key:
+            if (isListProp) {
+                const formattedItems = prop.items
+                    .map(it => formatListItem(it))
+                    .filter(Boolean)
+                    .join("\n");
+                const replacement = formattedItems.length > 0 ? `${key}:\n${formattedItems}` : `${key}:`;
+                frontmatter = frontmatter.replace(keyLineRegex, replacement);
+            } else if (prop.type !== "empty") {
+                frontmatter = frontmatter.replace(keyLineRegex, `${key}: ${prop.value}`);
+            }
+        } else {
+            // Single scalar on the same line: key: value
+            if (isListProp) {
+                if (restOfKeyLine.includes("<%")) {
+                    const formattedItems = prop.items
+                        .map(it => formatListItem(it))
+                        .filter(Boolean)
+                        .join("\n");
+                    frontmatter = frontmatter.replace(keyLineRegex, `${key}:\n${formattedItems}`);
+                } else {
+                    const existingItems = extractListItems(restOfKeyLine);
+                    const itemsToAdd = [];
+                    for (const it of prop.items) {
+                        if (!isItemAlreadyInList(it, restOfKeyLine)) {
+                            itemsToAdd.push(it);
+                        }
+                    }
+                    const allItems = [...existingItems, ...itemsToAdd]
+                        .map(it => formatListItem(it))
+                        .join("\n");
+                    frontmatter = frontmatter.replace(keyLineRegex, `${key}:\n${allItems}`);
+                }
+            } else if (prop.type === "scalar") {
+                frontmatter = frontmatter.replace(keyLineRegex, `${key}: ${prop.value}`);
+            }
+        }
+    }
+
+    const cleanFm = frontmatter.replace(/^\r?\n+|\r?\n+$/g, "");
+    const cleanRest = restOfContent.replace(/^\r?\n+/, "");
+    return cleanRest.length > 0
+        ? `---\n${cleanFm}\n---\n${cleanRest}`
+        : `---\n${cleanFm}\n---\n`;
+}
+
 function parseBlocksFromLines(lines) {
     const blocks = [];
     let i = 0;
@@ -965,8 +1531,15 @@ function parseBlocksFromLines(lines) {
             continue;
         }
 
-        // Horizontal divider / thematic break
+        // Horizontal divider / thematic break OR Section metadata block (--- ... ---)
         if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+            const metadataBlock = tryParseMetadataBlock(lines, i);
+            if (metadataBlock) {
+                blocks.push(metadataBlock);
+                i = metadataBlock.nextIdx;
+                continue;
+            }
+
             blocks.push({ type: "divider", lines: [line] });
             i++;
             continue;
@@ -1174,6 +1747,149 @@ function createAtomicNotes(tp, options = {}) {
         }
         const { templateStart, templateEnd } = resolvedTmpl;
 
+        // 2b. Special templates for specific words
+        const specialTemplates = [];
+
+        // Check if keywordTemplates passed in options:
+        // [ { words: ["Aufgabe", "Übung"], templateFile: "..." }, ... ]
+        if (Array.isArray(options.keywordTemplates)) {
+            for (const item of options.keywordTemplates) {
+                const words = parseWordList(item.words);
+                if (words.length === 0) continue;
+                const tmpl = await resolveTemplate(app, tp, {
+                    ...options,
+                    templateFile: item.templateFile || item.file,
+                    templateStart: item.templateStart,
+                    templateEnd: item.templateEnd,
+                    skipPrompt: true,
+                    skipTemplatePrompt: true
+                });
+                if (!tmpl.cancelled) {
+                    specialTemplates.push({
+                        words,
+                        templateStart: tmpl.templateStart,
+                        templateEnd: tmpl.templateEnd,
+                        templateName: tmpl.templateName
+                    });
+                }
+            }
+        }
+
+        // Check if specialWords passed in options:
+        const optSpecialWords = options.specialWords || options.customTemplateWords;
+        if (optSpecialWords && (!options.keywordTemplates || options.keywordTemplates.length === 0)) {
+            const words = parseWordList(optSpecialWords);
+            if (words.length > 0) {
+                const sepFile = options.specialTemplateFile || options.specialTemplate || options.customTemplateFile;
+                const tmpl = await resolveTemplate(app, tp, {
+                    ...options,
+                    templateFile: sepFile,
+                    promptTitle: `Welches separate Template soll für '${words.join(", ")}' genutzt werden?`,
+                    skipPrompt: Boolean(options.skipPrompt || sepFile),
+                    skipTemplatePrompt: Boolean(options.skipPrompt || sepFile)
+                });
+                if (tmpl.cancelled) {
+                    new Notice("Abgebrochen: Vorgang abgebrochen.");
+                    return "";
+                }
+                specialTemplates.push({
+                    words,
+                    templateStart: tmpl.templateStart,
+                    templateEnd: tmpl.templateEnd,
+                    templateName: tmpl.templateName
+                });
+            }
+        }
+
+        // Interactive prompt for specific words if not supplied in options
+        if (
+            specialTemplates.length === 0 &&
+            options.askSpecialTemplate !== false &&
+            !options.specialWords &&
+            !options.customTemplateWords &&
+            !options.keywordTemplates &&
+            tp && tp.system && typeof tp.system.prompt === "function" &&
+            !options.skipPrompt
+        ) {
+            const wordsPrompt = await tp.system.prompt(
+                "Spezifische Wörter für separates Template (optional, kommagetrennt - Enter für keines):",
+                ""
+            );
+            if (wordsPrompt === null) {
+                new Notice("Abgebrochen: Vorgang abgebrochen.");
+                return "";
+            }
+            const words = parseWordList(wordsPrompt);
+            if (words.length > 0) {
+                let continueAdding = true;
+                let currentWords = words;
+
+                while (continueAdding) {
+                    const sepTmpl = await resolveTemplate(app, tp, {
+                        ...options,
+                        templateFile: null,
+                        templateStart: null,
+                        templateEnd: null,
+                        templateStartFile: null,
+                        templateEndFile: null,
+                        promptTitle: `Welches separate Template soll für '${currentWords.join(", ")}' genutzt werden?`
+                    });
+
+                    if (sepTmpl.cancelled) {
+                        new Notice("Abgebrochen: Vorgang abgebrochen.");
+                        return "";
+                    }
+
+                    specialTemplates.push({
+                        words: currentWords,
+                        templateStart: sepTmpl.templateStart,
+                        templateEnd: sepTmpl.templateEnd,
+                        templateName: sepTmpl.templateName
+                    });
+
+                    // Ask if user wants to add another template for other words
+                    if (typeof tp.system.suggester === "function") {
+                        const moreChoices = [
+                            "Nein, weiter [Standard]",
+                            "Ja, weitere Wörter & Template hinzufügen",
+                            "❌ Vorgang abbrechen"
+                        ];
+                        const moreValues = [false, true, "CANCEL"];
+                        const moreChosen = await tp.system.suggester(
+                            moreChoices,
+                            moreValues,
+                            false,
+                            "Möchtest du für weitere Wörter noch ein separates Template festlegen?"
+                        );
+                        if (moreChosen === "CANCEL" || moreChosen === undefined) {
+                            new Notice("Abgebrochen: Vorgang abgebrochen.");
+                            return "";
+                        }
+                        if (moreChosen === true) {
+                            const nextWordsPrompt = await tp.system.prompt(
+                                "Gib weitere spezifische Wörter ein (kommagetrennt):",
+                                ""
+                            );
+                            if (nextWordsPrompt === null) {
+                                new Notice("Abgebrochen: Vorgang abgebrochen.");
+                                return "";
+                            }
+                            const nextWords = parseWordList(nextWordsPrompt);
+                            if (nextWords.length === 0) {
+                                continueAdding = false;
+                            } else {
+                                currentWords = nextWords;
+                            }
+                        } else {
+                            continueAdding = false;
+                        }
+                    } else {
+                        continueAdding = false;
+                    }
+                }
+            }
+        }
+
         // 3. Determine parent topic / existingTags
         let existingTags = options.existingTags || [];
         if (!Array.isArray(existingTags)) {
@@ -1367,6 +2083,13 @@ function createAtomicNotes(tp, options = {}) {
                     let noteStartText = "";
                     let preExistingBody = "";
 
+                    const activeTemplate = getTemplateForTitle(
+                        block.title,
+                        safeTitle,
+                        { templateStart, templateEnd },
+                        specialTemplates
+                    );
+
                     if (existingFile) {
                         const existingContent = (await app.vault.read(existingFile)).replace(/\r\n?/g, "\n");
                         const fmMatch = existingContent.match(/^---\n[\s\S]*?\n---[ \t]*(\n|$)/);
@@ -1374,11 +2097,11 @@ function createAtomicNotes(tp, options = {}) {
                             noteStartText = addUpToFrontmatter(fmMatch[0], upList);
                             preExistingBody = existingContent.slice(fmMatch[0].length).trim();
                         } else {
-                            noteStartText = createUpperPartOfTemplate(templateStart, upList, [safeTitle], addCodeTag);
+                            noteStartText = createUpperPartOfTemplate(activeTemplate.templateStart, upList, [safeTitle], addCodeTag);
                             preExistingBody = existingContent.trim();
                         }
                     } else {
-                        noteStartText = createUpperPartOfTemplate(templateStart, upList, [safeTitle], addCodeTag);
+                        noteStartText = createUpperPartOfTemplate(activeTemplate.templateStart, upList, [safeTitle], addCodeTag);
 
                         // Replace Templater title placeholders
                         noteStartText = noteStartText.replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, safeTitle);
@@ -1398,7 +2121,8 @@ function createAtomicNotes(tp, options = {}) {
                         preExistingBody: preExistingBody,
                         isExistingFile: !!existingFile,
                         hasSubheadings: false,
-                        bodyLines: []
+                        bodyLines: [],
+                        templateEnd: activeTemplate.templateEnd
                     };
                     notes.push(currentNote);
                 }
@@ -1437,6 +2161,16 @@ function createAtomicNotes(tp, options = {}) {
                 if (useBlockReferences) {
                     overarchingBodyLines.push(block.lines[0]);
                 }
+            }
+            continue;
+        }
+
+        if (block.type === "metadata") {
+            if (currentNote) {
+                currentNote.startText = mergeMetadataIntoFrontmatter(
+                    currentNote.startText,
+                    block.metadata || block.rawYaml
+                );
             }
             continue;
         }
@@ -1539,10 +2273,12 @@ function createAtomicNotes(tp, options = {}) {
             fullText += body + "\n";
         }
 
+        const currentTemplateEnd = (note.templateEnd !== undefined) ? note.templateEnd : templateEnd;
+
         const insertUnterthemen = options.insertUnterthemen !== false && options.addUnterthemen !== false;
         if (insertUnterthemen && (note.hasSubheadings || options.forceUnterthemen === true)) {
             const hasUnterthemen = /^\s*#+\s+Unterthemen\b/m.test(fullText) ||
-                                   /^\s*#+\s+Unterthemen\b/m.test(templateEnd || "");
+                                   /^\s*#+\s+Unterthemen\b/m.test(currentTemplateEnd || "");
             if (!hasUnterthemen) {
                 const unterthemenBlock = (options.unterthemenBlock || buildUnterthemenBlock()).trimEnd();
                 if (note.preExistingBody) {
@@ -1567,12 +2303,15 @@ function createAtomicNotes(tp, options = {}) {
             }
         }
 
-        if ((!note.isExistingFile || !note.preExistingBody) && templateEnd && templateEnd.trim().length > 0) {
+        if ((!note.isExistingFile || !note.preExistingBody) && currentTemplateEnd && currentTemplateEnd.trim().length > 0) {
             const stamp = (typeof window !== "undefined" && window.moment)
                 ? window.moment().format("DD.MM.YYYY HH:mm")
                 : (tp.date ? tp.date.now("DD.MM.YYYY HH:mm") : new Date().toLocaleString("de-DE"));
-            const endText = templateEnd
-                .replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, note.fileName.split(" - ").slice(1).join(" - "))
+            const titleWithoutPrefix = note.fileName.includes(" - ")
+                ? note.fileName.split(" - ").slice(1).join(" - ")
+                : note.fileName;
+            const endText = currentTemplateEnd
+                .replace(/<%\s*tp\.file\.title\.split\(["']\s*-\s*["']\)\[1\]\s*%>/gi, titleWithoutPrefix)
                 .replace(/<%\s*tp\.file\.title\s*%>/gi, note.fileName)
                 .replace(/<%\s*tp\.date\.now\(\s*["']DD\.MM\.YYYY HH:mm["']\s*\)\s*%>/gi, stamp);
             if (fullText) {
@@ -1592,6 +2331,42 @@ function createAtomicNotes(tp, options = {}) {
         // Final pass to ensure all heading references across the note are replaced
         fullText = replaceHeadingReferencesInText(fullText, headingMap);
 
+        // Normalize any frontmatter list items:
+        // 1) Repair single-bracket links: - "[Note|Alias]" -> - "[[Note|Alias]]"
+        // 2) Split list item lines that contain multiple wikilinks into separate list items
+        const fmEndMatch = fullText.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+        if (fmEndMatch) {
+            const rawFm = fmEndMatch[0];
+            const fixedLines = [];
+            for (const line of rawFm.split(/\r?\n/)) {
+                const listMatch = line.match(/^(\s*-\s*)(.*)$/);
+                if (listMatch) {
+                    const prefix = listMatch[1];
+                    const content = listMatch[2].trim();
+                    const wikilinks = Array.from(content.matchAll(/\[\[([^\]\r\n]+)\]\]/g));
+
+                    if (wikilinks.length > 1) {
+                        for (const w of wikilinks) {
+                            fixedLines.push(`${prefix}"${w[0]}"`);
+                        }
+                        continue;
+                    }
+
+                    // Single-bracket link repair: - "[Note|Alias]" -> - "[[Note|Alias]]"
+                    const singleBracketMatch = content.match(/^["'`]?\[([^\[\]\r\n]+)\]["'`]?$/);
+                    if (singleBracketMatch) {
+                        fixedLines.push(`${prefix}"[[${singleBracketMatch[1]}]]"`);
+                        continue;
+                    }
+                }
+                fixedLines.push(line);
+            }
+            const fixedFm = fixedLines.join("\n");
+            if (fixedFm !== rawFm) {
+                fullText = fixedFm + fullText.slice(rawFm.length);
+            }
+        }
+
         // Renumber footnotes so that each created note starts numbering at 1
         fullText = renumberFootnotesInText(fullText, note.headingTitle);
 
@@ -1609,7 +2384,11 @@ function createAtomicNotes(tp, options = {}) {
     }
 
     if (!options.silent) {
-        new Notice(`✅ ${createdCount} atomare Notizen erfolgreich erstellt!`);
+        if (typeof Notice !== "undefined") {
+            new Notice(`✅ ${createdCount} atomare Notizen erfolgreich erstellt!`);
+        } else {
+            console.log(`[Notice] ✅ ${createdCount} atomare Notizen erfolgreich erstellt!`);
+        }
     }
 
     const overarchingContent = useBlockReferences
@@ -1657,3 +2436,12 @@ module.exports.cleanTitle = cleanTitle;
 module.exports.renumberFootnotesInText = renumberFootnotesInText;
 module.exports.addUpToFrontmatter = addUpToFrontmatter;
 module.exports.buildUnterthemenBlock = buildUnterthemenBlock;
+module.exports.getTemplateForTitle = getTemplateForTitle;
+module.exports.parseWordList = parseWordList;
+module.exports.resolveTemplate = resolveTemplate;
+module.exports.tryParseMetadataBlock = tryParseMetadataBlock;
+module.exports.parseMetadataYaml = parseMetadataYaml;
+module.exports.mergeMetadataIntoFrontmatter = mergeMetadataIntoFrontmatter;
+module.exports.formatListItem = formatListItem;
+module.exports.extractListItems = extractListItems;
+module.exports.hasOuterArrayBrackets = hasOuterArrayBrackets;

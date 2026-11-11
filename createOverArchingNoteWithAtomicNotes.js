@@ -19,6 +19,10 @@
  *   useBlockReferences (bool) - Keep content as paragraph references (![[...#^id]]) vs. delete and insert # Unterthemen
  *   templateFile              - Path or TFile of the template to use (skips template prompt)
  *   templateFolder            - Path to folder containing templates (default: "5 - Templates and Scripts/Template Notes")
+ *   specialWords              - Array or comma-separated string of words to use a separate template for
+ *   specialTemplateFile       - Path or TFile of the separate template for notes matching specialWords
+ *   keywordTemplates          - Array of { words: [...], templateFile: "..." }
+ *   askSpecialTemplate (bool) - Whether to prompt for separate template words interactively
  *   skipPrompt (bool)         - If true, skips interactive prompts (e.g. template selection)
  *   skipTemplatePrompt (bool) - If true, skips interactive template selection
  *   targetFolder              - Target folder for created notes (default: vault root)
@@ -205,7 +209,16 @@ function createOverArchingNoteWithAtomicNotes(tp, options = {}) {
     const promise = (async () => {
         const app = tp.app || window.app;
 
-        if (typeof tp.user?.createAtomicNotes !== "function") {
+        let createAtomicNotesFunc = tp.user?.createAtomicNotes;
+        if (typeof createAtomicNotesFunc !== "function") {
+            try {
+                createAtomicNotesFunc = require("./createAtomicNotes.js");
+            } catch (e) {
+                // Fallback
+            }
+        }
+
+        if (typeof createAtomicNotesFunc !== "function") {
             new Notice("❌ tp.user.createAtomicNotes wurde nicht gefunden (createAtomicNotes.js im User-Scripts-Ordner?).");
             return "";
         }
@@ -283,7 +296,7 @@ function createOverArchingNoteWithAtomicNotes(tp, options = {}) {
         // "Übungsaufgaben", "Quellen" and "Unterthemen" are not topics and are not split.
         const stopHeadings = options.stopHeadings || ["Übungsaufgaben", "Quellen", "Referenz", "Unterthemen"];
 
-        const result = await tp.user.createAtomicNotes(tp, {
+        const result = await createAtomicNotesFunc(tp, {
             ...options,
             useBlockReferences,
             maxLevel,
